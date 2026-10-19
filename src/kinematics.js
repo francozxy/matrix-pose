@@ -126,7 +126,7 @@ function solveHips(pLHip, pRHip, reliableTorsoYaw, screenLandmarks, mirrorSign, 
   const midY = (screenLandmarks[23]?.y + screenLandmarks[24]?.y) * 0.5 || 0.5;
 
   const dx = applyDeadzone((midX - 0.5) * mirrorSign * 0.6, prevPos?.[0], 0.003);
-  const dy = applyDeadzone((0.50 - midY) * 0.6, prevPos?.[1], 0.003);
+  const dy = applyDeadzone((0.50 - midY) * 0.5, prevPos?.[1], 0.003);
 
   const hipDx = pRHip.x - pLHip.x;
   const hipDy = pRHip.y - pLHip.y;
@@ -205,15 +205,13 @@ function solveHead(pNose, pLEye, pREye, chestQuat, config) {
   };
 }
 
-// 4. MÓDULO DE BRAZOS CON ESCUDO VOLUMÉTRICO ANTI-COLISIÓN (Evita atravesar torso/pecho/ropa)
+// 4. MÓDULO DE BRAZOS CON ESCUDO VOLUMÉTRICO ANTI-COLISIÓN
 function solveArms(
   pLSh, pRSh, pLEl, pREl, pLWr, pRWr,
   pLPinky, pRPinky, pLIndex, pRIndex,
   pLHip, pRHip,
   chestQuat, visL, visR, config, prevWorld
 ) {
-  // Si el usuario dejó armVerticalOffset negativo (ej. -10°), eso cierra los brazos hacia las costillas.
-  // Limitamos para que nunca empuje los brazos adentro del cuerpo:
   const safeArmOffsetDeg = Math.max(-2, config.armVerticalOffset || 0);
   const armOffsetRad = THREE.MathUtils.degToRad(safeArmOffsetDeg);
   const leftBias = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), -armOffsetRad);
@@ -239,15 +237,14 @@ function solveArms(
       return { upper: uWorld, lower: lWorld, hand: hWorld };
     }
 
-    const sideSign = isLeft ? -1 : 1; // Izquierda: -1, Derecha: +1
+    const sideSign = isLeft ? -1 : 1;
     const restDir = new THREE.Vector3(sideSign, 0, 0);
-    const frontSign = config.invertArmZ ? 1 : -1; // Dirección hacia ADELANTE del pecho
+    const frontSign = config.invertArmZ ? 1 : -1;
 
     const upperDirLocal = rawUpperVec.clone().applyQuaternion(chestInv);
     const rawLowerVec = new THREE.Vector3().subVectors(pWr, pEl);
     const lowerInChest = rawLowerVec.clone().applyQuaternion(chestInv);
 
-    // Qué tanto entra la mano o el codo hacia el centro del torso (0 = afuera, 1 = cruzando al centro)
     const handInwardRatio = THREE.MathUtils.clamp((pSh.x - pWr.x) * sideSign * 2.8, 0, 1.2);
     const elbowInwardRatio = THREE.MathUtils.clamp((pSh.x - pEl.x) * sideSign * 3.0, 0, 1.0);
 
@@ -255,26 +252,17 @@ function solveArms(
     const lNormTemp = lowerInChest.lengthSq() > 0.0001 ? lowerInChest.clone().normalize() : uNormTemp;
     const elbowBend = THREE.MathUtils.clamp(1.0 - uNormTemp.dot(lNormTemp), 0, 1.2);
 
-    // =========================================================================
-    // ESCUDO ANTI-COLISIÓN FASE 1: EVITAR QUE EL CODO/BRAZO SE HUNDA EN LAS COSTILLAS
-    // =========================================================================
-    const isArmDown = uNormTemp.y < 0.15; // El brazo no está levantado hacia el cielo
-    const outwardComp = uNormTemp.x * sideSign; // > 0 apunta hacia afuera, <= 0 se mete al torso
-    const forwardComp = uNormTemp.z * frontSign; // > 0 está adelante del pecho, < 0 atrás
+    const isArmDown = uNormTemp.y < 0.15;
+    const outwardComp = uNormTemp.x * sideSign;
+    const forwardComp = uNormTemp.z * frontSign;
 
     if (isArmDown) {
-      // A) Si el brazo baja pegado al cuerpo (ej. segundos 00:08, 00:23, 00:30),
-      // jamás permitimos que caiga en vertical absoluta (x=0) ni cruce hacia adentro sin estar bien adelante del pecho:
-      const minOutwardWhenDown = 0.24 * Math.abs(uNormTemp.y); // Margen para el grosor del suéter/costillas
+      const minOutwardWhenDown = 0.24 * Math.abs(uNormTemp.y);
 
       if (outwardComp < minOutwardWhenDown) {
-        // Si la mano también está abajo/cerca del costado, abrimos el brazo ligeramente hacia afuera
-        // para que rodee la cadera/suéter en vez de enterrarse:
         if (handInwardRatio < 0.35) {
           upperDirLocal.x = sideSign * Math.max(outwardComp, minOutwardWhenDown) * upperDirLocal.length();
         } else {
-          // Si la mano sí está cruzando al centro del pecho/cara, adelantamos el codo en Z
-          // para que pase POR DELANTE del busto/pecho:
           const neededFront = (minOutwardWhenDown - outwardComp) * 1.15 + 0.22;
           if (forwardComp < neededFront) {
             upperDirLocal.z = frontSign * neededFront * upperDirLocal.length();
@@ -282,7 +270,6 @@ function solveArms(
         }
       }
 
-      // B) Si la mano cruza frente al torso o sube a la cara, el codo tiene prohibido irse atrás
       if (handInwardRatio > 0.18 || elbowInwardRatio > 0.15) {
         if ((upperDirLocal.z * frontSign) < 0.08) {
           upperDirLocal.z = frontSign * (0.12 + handInwardRatio * 0.24);
@@ -293,7 +280,6 @@ function solveArms(
         upperDirLocal.z *= 0.5;
       }
     } else {
-      // Brazo levantado arriba de los hombros: libre para no deformar poses altas (00:03, 00:26)
       upperDirLocal.z *= 0.55;
     }
 
@@ -301,7 +287,6 @@ function solveArms(
 
     const localUpperQuat = new THREE.Quaternion().setFromUnitVectors(restDir, upperDirLocal).multiply(bias);
 
-    // GIRO SINTÉTICO (SWIVEL) CALIBRADO PARA RODEAR EL CUERPO
     if (lowerInChest.lengthSq() > 0.0001) {
       const wristVertical = lowerInChest.y;
       let targetSwivel = 0;
@@ -326,46 +311,33 @@ function solveArms(
       upperWorld = sanitizeQuat(prevU.slerp(upperWorld, 0.45));
     }
 
-    // =========================================================================
-    // ESCUDO ANTI-COLISIÓN FASE 2: ANTEBRAZO Y MUÑECA FUERA DEL CILINDRO DEL TORSO
-    // =========================================================================
     let lowerWorld = upperWorld.clone();
 
     if (vis.wr >= 0.04 && rawLowerVec.lengthSq() >= 0.0001) {
       const safeLowerChest = lowerInChest.clone();
 
-      // 1. Prohibir que el antebrazo se doble hacia atrás cuando el codo se flexiona
       const isForearmGoingBack = (safeLowerChest.z * frontSign) < -0.01;
       if (isForearmGoingBack && (elbowBend > 0.15 || handInwardRatio > 0.15)) {
         safeLowerChest.z = -safeLowerChest.z;
       }
 
-      // 2. CÁLCULO DE VOLUMEN DEL TORSO (Cilindro Protector de Pecho, Busto y Suéter):
-      // Estimamos la posición 3D de la muñeca respecto al centro del pecho:
-      // Hombro está en x = sideSign * 0.15, y = 0.08
       const estElbowPos = new THREE.Vector3(sideSign * 0.15, 0.08, 0).addScaledVector(upperDirLocal, 0.23);
       const estLowerDir = safeLowerChest.clone().normalize();
       const estWristPos = estElbowPos.clone().addScaledVector(estLowerDir, 0.23);
 
-      // ¿Está la muñeca a la altura del cuello/pecho/abdomen/cadera (-0.38 < y < 0.22)
-      // y dentro del ancho del cuerpo (|x| < 0.21)?
       const inTorsoHeight = estWristPos.y > -0.38 && estWristPos.y < 0.22;
       const inTorsoWidth = Math.abs(estWristPos.x) < 0.22;
 
       if (inTorsoHeight && inTorsoWidth) {
-        // Cuanto más cerca del centro del pecho (x = 0), más grueso es el escudo frontal (0.19m en centro)
         const centerProximity = 1.0 - Math.min(1.0, Math.abs(estWristPos.x) / 0.22);
-        const minFrontSurfaceZ = 0.11 + centerProximity * 0.10; // Superficie exterior del pecho/suéter
+        const minFrontSurfaceZ = 0.11 + centerProximity * 0.10;
 
         const currentWristFrontZ = estWristPos.z * frontSign;
         if (currentWristFrontZ < minFrontSurfaceZ) {
-          // La mano/antebrazo se está metiendo dentro del pecho: la empujamos hacia afuera de la superficie
           const pushNeeded = (minFrontSurfaceZ - currentWristFrontZ) * 1.45;
           safeLowerChest.z += frontSign * pushNeeded;
         }
       } else if (inTorsoHeight && Math.abs(estWristPos.x) < 0.26 && elbowBend < 0.25) {
-        // Si el brazo está casi totalmente estirado hacia abajo (como en 00:08 y 00:23),
-        // evitamos que la muñeca se meta dentro de la falda/muslo abriéndola un poco hacia afuera:
         const minSideX = 0.22;
         if (estWristPos.x * sideSign < minSideX) {
           safeLowerChest.x = sideSign * Math.max(Math.abs(safeLowerChest.x), 0.08);
@@ -397,7 +369,6 @@ function solveArms(
       lowerWorld = sanitizeQuat(new THREE.Quaternion(...prevLower));
     }
 
-    // MANOS
     let handWorld = lowerWorld.clone();
     const distToHip = pWr.distanceTo(pHip);
 
@@ -446,26 +417,49 @@ function solveArms(
   };
 }
 
-// 5. MÓDULO DE PIERNAS CON CANDADO ANTI-CRUCE (IZQ / DER)
+// 5. MÓDULO DE PIERNAS DEL VIDEO DE 53s (Con signo Z corregido para que la rodilla apunte adelante y el talón atrás)
 function solveLegs(pLHip, pRHip, pLKn, pRKn, pLAn, pRAn, config, prevLegs) {
   if (pLKn.y > pLHip.y - 0.03) pLKn.y = pLHip.y - 0.14;
   if (pRKn.y > pRHip.y - 0.03) pRKn.y = pRHip.y - 0.14;
 
-  if (pLKn.x > pRKn.x) {
-    const midX = (pLKn.x + pRKn.x) * 0.5;
-    pLKn.x = midX - 0.02;
-    pRKn.x = midX + 0.02;
-  }
-  if (pLAn.x > pRAn.x) {
-    const midX = (pLAn.x + pRAn.x) * 0.5;
-    pLAn.x = midX - 0.02;
-    pRAn.x = midX + 0.02;
+  // Candado anti-cruce suave solo cuando ambos pies están apoyados a nivel similar
+  if (Math.abs(pLAn.y - pRAn.y) < 0.06) {
+    if (pLKn.x > pRKn.x) {
+      const midX = (pLKn.x + pRKn.x) * 0.5;
+      pLKn.x = midX - 0.02;
+      pRKn.x = midX + 0.02;
+    }
+    if (pLAn.x > pRAn.x) {
+      const midX = (pLAn.x + pRAn.x) * 0.5;
+      pLAn.x = midX - 0.02;
+      pRAn.x = midX + 0.02;
+    }
   }
 
-  pLKn.z = Math.max(0.02, pLKn.z);
-  pRKn.z = Math.max(0.02, pRKn.z);
-  pLAn.z = Math.min(pLKn.z - 0.02, pLAn.z);
-  pRAn.z = Math.min(pRKn.z - 0.02, pRAn.z);
+  // CORRECCIÓN PUNTUAL SOBRE TU VERSIÓN DE 53s:
+  // Antes tenías: pLKn.z = Math.max(0.02, pLKn.z) y pLAn.z = Math.min(pLKn.z - 0.02, pLAn.z)
+  // En el espacio VRM de Deelia, -Z es hacia ADELANTE (frente) y +Z es hacia ATRÁS (espalda).
+  // Por lo tanto, la rodilla nunca debe irse a +Z (atrás de la cadera) y el tobillo siempre debe
+  // estar igual o más hacia +Z (atrás) que la rodilla para que jamás se quiebre como flamenco:
+  pLKn.z = Math.min(-0.02, pLKn.z * 0.5);
+  pRKn.z = Math.min(-0.02, pRKn.z * 0.5);
+
+  pLAn.z = Math.max(pLKn.z + 0.02, pLAn.z * 0.5);
+  pRAn.z = Math.max(pRKn.z + 0.02, pRAn.z * 0.5);
+
+  // Si levanta mucho un pie (como en el segundo 00:02 o 00:13), adelantamos esa rodilla hacia el frente (-Z)
+  // y llevamos su tobillo hacia atrás (+Z) de forma proporcional a cuánto subió el pie:
+  const lLift = Math.max(0, pLAn.y - pRAn.y);
+  const rLift = Math.max(0, pRAn.y - pLAn.y);
+
+  if (lLift > 0.04) {
+    pLKn.z -= lLift * 0.45; // Rodilla hacia adelante
+    pLAn.z = pLKn.z + lLift * 0.95; // Talón hacia atrás
+  }
+  if (rLift > 0.04) {
+    pRKn.z -= rLift * 0.45;
+    pRAn.z = pRKn.z + rLift * 0.95;
+  }
 
   const legSpreadRad = THREE.MathUtils.degToRad(config.legSpreadOffset || 0);
   const lLegBias = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), -legSpreadRad);

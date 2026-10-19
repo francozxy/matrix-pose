@@ -48,8 +48,9 @@ export default function App() {
   const [controlsOnTop, setControlsOnTop] = useState(false);
   const [copyFeedback, setCopyFeedback] = useState('');
   const [exportLogs, setExportLogs] = useState([]);
-  // Activado por defecto para corregir el Z:+46° -> Z:-46° que vimos en tu captura
   const [exportFlipVrm0, setExportFlipVrm0] = useState(true);
+  // Por defecto false para que al volver a grabar NO se quede pegada la pierna/brazo de un frame anterior
+  const [keepOffsetsOnRecord, setKeepOffsetsOnRecord] = useState(false);
 
   const [vrmList, setVrmList] = useState([]);
   const [activeVrmIndex, setActiveVrmIndex] = useState(0);
@@ -153,7 +154,6 @@ export default function App() {
   };
 
   // Extrae cualquier rotación hecha en vivo en el esqueleto de Deelia respecto al último frame de MediaPipe
-  // para garantizar que nunca salga "Sin offsets manuales" si moviste el Gizmo
   const getSyncedOffsetsFromDeelia = () => {
     const merged = { ...boneOffsetsRef.current };
     const currentAvatar = vrmListRef.current?.[activeVrmIndexRef.current];
@@ -167,7 +167,6 @@ export default function App() {
         if (node && baseArr) {
           const baseQ = new THREE.Quaternion(baseArr[0], baseArr[1], baseArr[2], baseArr[3]).normalize();
           const liveQ = node.quaternion.clone().normalize();
-          // diffQ = baseQ^-1 * liveQ
           const diffQ = baseQ.clone().invert().multiply(liveQ);
           const e = new THREE.Euler().setFromQuaternion(diffQ, 'YXZ');
           const rx = Math.round(THREE.MathUtils.radToDeg(e.x));
@@ -584,14 +583,25 @@ export default function App() {
     setIsPlayingPreview(false);
 
     if (!isRecording) {
-      // Sincronizar cualquier movimiento hecho en Deelia antes de empezar a grabar
-      const synced = getSyncedOffsetsFromDeelia();
-      boneOffsetsRef.current = synced;
-      setBoneOffsets(synced);
+      if (!keepOffsetsOnRecord) {
+        // Limpiamos los giros hechos en un frame pausado para que NO se quede una pierna o brazo fijo en todo el video
+        boneOffsetsRef.current = {};
+        setBoneOffsets({});
+        const currentAvatar = vrmListRef.current?.[activeVrmIndexRef.current];
+        if (currentAvatar) currentAvatar.offsets = {};
+      } else {
+        const synced = getSyncedOffsetsFromDeelia();
+        boneOffsetsRef.current = synced;
+        setBoneOffsets(synced);
+      }
 
       setSelectedBone('');
       setRecordedFrames([]);
-      setExportLogs([`🔴 Grabando frames con tus ajustes activos...`]);
+      setExportLogs([
+        keepOffsetsOnRecord
+          ? `🔴 Grabando desde 0.00s manteniendo offsets globales...`
+          : `🔴 Grabando animación limpia desde 0.00s (sin poses trabadas)...`
+      ]);
       prevPoseRef.current = null;
       isProcessingRef.current = false;
       lastProcessTimeRef.current = performance.now();
@@ -606,7 +616,7 @@ export default function App() {
           setTimeout(() => vid.play().catch(() => {}), 100);
         });
       }
-      setStatusText('🔴 Capturando movimiento con tus ajustes...');
+      setStatusText('🔴 Capturando movimiento...');
     } else {
       isRecRef.current = false;
       isProcessingRef.current = false;
@@ -614,7 +624,7 @@ export default function App() {
       vid.pause();
       setExportLogs((prev) => [
         ...prev,
-        `⏹ Captura detenida (${recordedFrames.length}f). Si ajustas un hueso ahora, se incluirá al exportar.`
+        `⏹ Captura detenida (${recordedFrames.length}f).`
       ]);
       setStatusText(`✅ Pausado (${recordedFrames.length} frames) - Toca un hueso verde para ajustar`);
     }
@@ -848,6 +858,15 @@ export default function App() {
                 </div>
               </div>
             )}
+
+            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '11px', color: '#94a3b8', cursor: 'pointer' }}>
+              <input
+                type="checkbox"
+                checked={keepOffsetsOnRecord}
+                onChange={(e) => setKeepOffsetsOnRecord(e.target.checked)}
+              />
+              📌 Mantener ajustes del Gizmo al grabar de nuevo (Desactivar para que no se trabe en todo el video)
+            </label>
 
             <div className="mp-btn-row" style={{ marginTop: '2px' }}>
               <button
