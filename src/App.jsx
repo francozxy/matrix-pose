@@ -8,6 +8,55 @@ import { buildVRMABinary, buildVMDBinary, bakeOffsetsIntoFrames } from './export
 import PosingPanel from './components/PosingPanel';
 import CanvasViewer from './components/CanvasViewer';
 
+const DB_NAME = 'MatrixPoseDB';
+const STORE_NAME = 'vrmStore';
+const DB_VERSION = 1;
+
+function openVrmDB() {
+  return new Promise((resolve, reject) => {
+    const request = indexedDB.open(DB_NAME, DB_VERSION);
+    request.onerror = () => reject(request.error);
+    request.onsuccess = () => resolve(request.result);
+    request.onupgradeneeded = (e) => {
+      const db = e.target.result;
+      if (!db.objectStoreNames.contains(STORE_NAME)) {
+        db.createObjectStore(STORE_NAME);
+      }
+    };
+  });
+}
+
+async function saveVrmToIndexedDB(fileBlob, fileName) {
+  try {
+    const db = await openVrmDB();
+    const tx = db.transaction(STORE_NAME, 'readwrite');
+    const store = tx.objectStore(STORE_NAME);
+    store.put({ blob: fileBlob, name: fileName }, 'last_vrm');
+    return new Promise((resolve, reject) => {
+      tx.oncomplete = () => resolve(true);
+      tx.onerror = () => reject(tx.error);
+    });
+  } catch (err) {
+    console.warn('No se pudo guardar en IndexedDB:', err);
+  }
+}
+
+async function loadVrmFromIndexedDB() {
+  try {
+    const db = await openVrmDB();
+    return new Promise((resolve, reject) => {
+      const tx = db.transaction(STORE_NAME, 'readonly');
+      const store = tx.objectStore(STORE_NAME);
+      const request = store.get('last_vrm');
+      request.onsuccess = () => resolve(request.result || null);
+      request.onerror = () => reject(request.error);
+    });
+  } catch (err) {
+    console.warn('No se pudo leer de IndexedDB:', err);
+    return null;
+  }
+}
+
 function loadMediaPipePoseScript() {
   if (window.Pose) return Promise.resolve(window.Pose);
   return new Promise((resolve, reject) => {
@@ -49,7 +98,6 @@ export default function App() {
   const [copyFeedback, setCopyFeedback] = useState('');
   const [exportLogs, setExportLogs] = useState([]);
   const [exportFlipVrm0, setExportFlipVrm0] = useState(true);
-  // Por defecto false para que al volver a grabar NO se quede pegada la pierna/brazo de un frame anterior
   const [keepOffsetsOnRecord, setKeepOffsetsOnRecord] = useState(false);
 
   const [vrmList, setVrmList] = useState([]);
@@ -153,7 +201,6 @@ export default function App() {
     }
   };
 
-  // Extrae cualquier rotación hecha en vivo en el esqueleto de Deelia respecto al último frame de MediaPipe
   const getSyncedOffsetsFromDeelia = () => {
     const merged = { ...boneOffsetsRef.current };
     const currentAvatar = vrmListRef.current?.[activeVrmIndexRef.current];
@@ -210,6 +257,85 @@ export default function App() {
     }
 
     applySolvedPose(prevPoseRef.current, updatedOffsets);
+  };
+
+  // Cargar automáticamente el último VRM guardado en IndexedDB al abrir la app
+  useEffect(() => {
+    loadVrmFromIndexedDB().then((saved) => {
+      if (saved && saved.blob) {
+        setStatusText(`Cargando ${saved.name} desde la memoria local...`);
+        const url = URL.createObjectURL(saved.blob);
+        loadVrmFromUrl(url, saved.name);
+      }
+    });
+  }, []);
+
+  const loadVrmFromUrl = (url, fileName) => {
+    const loader = new GLTFLoader();
+    loader.register((parser) => new VRMLoaderPlugin(parser));
+
+    loader.load(
+      url,
+      (gltf) => {
+        const loadedVrm = gltf.userData.vrm;
+        if (!loadedVrm) {
+          setStatusText('El archivo no es un VRM válido');
+          URL.revokeObjectURL(url);
+          return;
+        }
+
+        VRMUtils.rotateVRM0(loadedVrm);
+
+        const defaultPositions = {};
+        const baseQuats = {};
+        if (loadedVrm.humanoid) {
+          BONE_LIST.forEach((bName) => {
+            const node = loadedVrm.humanoid.getNormalizedBoneNode(bName);
+            if (node) {
+              defaultPositions[bName] = node.position.clone();
+              baseQuats[bName] = node.quaternion.clone();
+            }
+          });
+        }
+
+        const newAvatarData = {
+          vrm: loadedVrm,
+          scene: loadedVrm.scene,
+          offsets: {},
+          defaultPositions,
+          baseQuats
+        };
+
+        vrmListRef.current = [newAvatarData];
+        setVrmList([newAvatarData]);
+        setActiveVrmIndex(0);
+        setBoneOffsets({});
+        boneOffsetsRef.current = {};
+
+        const isVrm0 = String(loadedVrm.meta?.metaVersion) === '0';
+        setVrmName(`${fileName} (${isVrm0 ? 'VRM 0.x' : 'VRM 1.0'})`);
+        setStatusText(`✅ Avatar ${fileName} listo y guardado`);
+        URL.revokeObjectURL(url);
+      },
+      undefined,
+      (err) => {
+        console.error(err);
+        setStatusText('Error al cargar el modelo .VRM');
+        URL.revokeObjectURL(url);
+      }
+    );
+  };
+
+  const handleVRMUpload = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    // Guardar en IndexedDB para persistencia sin límite de tamaño
+    saveVrmToIndexedDB(file, file.name);
+
+    const url = URL.createObjectURL(file);
+    setStatusText(`Cargando avatar ${file.name}...`);
+    loadVrmFromUrl(url, file.name);
   };
 
   const previewExportOnDeelia = () => {
@@ -355,68 +481,6 @@ export default function App() {
     applySolvedPose(prevPoseRef.current, {});
     setCopyFeedback('🔄 Todos los huesos reseteados a 0°');
     setTimeout(() => setCopyFeedback(''), 2000);
-  };
-
-  const handleVRMUpload = (e) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    const url = URL.createObjectURL(file);
-    setStatusText(`Cargando avatar ${file.name}...`);
-
-    const loader = new GLTFLoader();
-    loader.register((parser) => new VRMLoaderPlugin(parser));
-
-    loader.load(
-      url,
-      (gltf) => {
-        const loadedVrm = gltf.userData.vrm;
-        if (!loadedVrm) {
-          setStatusText('El archivo no es un VRM válido');
-          URL.revokeObjectURL(url);
-          return;
-        }
-
-        VRMUtils.rotateVRM0(loadedVrm);
-
-        const defaultPositions = {};
-        const baseQuats = {};
-        if (loadedVrm.humanoid) {
-          BONE_LIST.forEach((bName) => {
-            const node = loadedVrm.humanoid.getNormalizedBoneNode(bName);
-            if (node) {
-              defaultPositions[bName] = node.position.clone();
-              baseQuats[bName] = node.quaternion.clone();
-            }
-          });
-        }
-
-        const newAvatarData = {
-          vrm: loadedVrm,
-          scene: loadedVrm.scene,
-          offsets: {},
-          defaultPositions,
-          baseQuats
-        };
-
-        vrmListRef.current = [newAvatarData];
-        setVrmList([newAvatarData]);
-        setActiveVrmIndex(0);
-        setBoneOffsets({});
-        boneOffsetsRef.current = {};
-
-        const isVrm0 = String(loadedVrm.meta?.metaVersion) === '0';
-        setVrmName(`${file.name} (${isVrm0 ? 'VRM 0.x' : 'VRM 1.0'})`);
-        setStatusText(`✅ Avatar ${file.name} listo`);
-        URL.revokeObjectURL(url);
-      },
-      undefined,
-      (err) => {
-        console.error(err);
-        setStatusText('Error al cargar el modelo .VRM');
-        URL.revokeObjectURL(url);
-      }
-    );
   };
 
   useEffect(() => {
@@ -584,7 +648,6 @@ export default function App() {
 
     if (!isRecording) {
       if (!keepOffsetsOnRecord) {
-        // Limpiamos los giros hechos en un frame pausado para que NO se quede una pierna o brazo fijo en todo el video
         boneOffsetsRef.current = {};
         setBoneOffsets({});
         const currentAvatar = vrmListRef.current?.[activeVrmIndexRef.current];
@@ -865,7 +928,7 @@ export default function App() {
                 checked={keepOffsetsOnRecord}
                 onChange={(e) => setKeepOffsetsOnRecord(e.target.checked)}
               />
-              📌 Mantener ajustes del Gizmo al grabar de nuevo (Desactivar para que no se trabe en todo el video)
+              📌 Mantener ajustes del Gizmo al grabar de nuevo
             </label>
 
             <div className="mp-btn-row" style={{ marginTop: '2px' }}>
