@@ -123,6 +123,11 @@ export default function App() {
     unlockRotation: false
   });
 
+
+  const [videoCurrentTime, setVideoCurrentTime] = useState(0);
+  const [videoDuration, setVideoDuration] = useState(0);
+
+
   const videoRef = useRef(null);
   const canvas2DRef = useRef(null);
   const poseInstanceRef = useRef(null);
@@ -773,6 +778,16 @@ export default function App() {
 
   const currentSelOffset = selectedBone ? (boneOffsets[selectedBone] || { rx: 0, ry: 0, rz: 0 }) : null;
 
+
+  const formatTime = (seconds) => {
+    if (!Number.isFinite(seconds) || seconds <= 0) return '00:00';
+    const mins = Math.floor(seconds / 60);
+    const secs = Math.floor(seconds % 60);
+    return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+  };
+
+
+
   return (
     <div className="mp-container">
       <style>{`
@@ -905,6 +920,8 @@ export default function App() {
                 src={videoUrl}
                 playsInline
                 muted
+                onTimeUpdate={(e) => setVideoCurrentTime(e.target.currentTime)}
+                onLoadedMetadata={(e) => setVideoDuration(e.target.duration)}
                 onEnded={() => {
                   if (isRecRef.current) toggleRecording();
                 }}
@@ -928,9 +945,15 @@ export default function App() {
             </div>
           </div>
 
+
+        
           <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '12px', color: '#94a3b8', margin: '8px 0 4px' }}>
             <span>{statusText}</span>
             <span style={{ color: '#fbbf24' }}>🎭 {vrmName}</span>
+           <span style={{ color: '#38bdf8', fontFamily: 'monospace', fontWeight: 700 }}>
+              ⏱️ {formatTime(videoCurrentTime)} / {formatTime(videoDuration)}
+            </span>
+
           </div>
 
           <div className="mp-btn-row">

@@ -97,7 +97,27 @@ function applyQuatDeadzone(currQ, prevQArray, threshold = 0.008) {
   return currQ;
 }
 
-function computeReliableYaw(shDx, rawShDz, pNose, pLEye, pREye, shCenter, hipCenter, pLKn, pRKn, unlockRotation = false) {
+function unwrapAngle(targetAngle, prevAngle) {
+  if (!Number.isFinite(prevAngle)) return targetAngle;
+  let diff = targetAngle - prevAngle;
+  while (diff > Math.PI) diff -= Math.PI * 2;
+  while (diff < -Math.PI) diff += Math.PI * 2;
+  return prevAngle + diff;
+}
+
+function computeReliableYaw(
+  shDx,
+  rawShDz,
+  pNose,
+  pLEye,
+  pREye,
+  shCenter,
+  hipCenter,
+  pLKn,
+  pRKn,
+  unlockRotation = false,
+  prevYaw = 0
+) {
   const eyeCenter = new THREE.Vector3().addVectors(pLEye, pREye).multiplyScalar(0.5);
   const faceLookX = (pNose.x - eyeCenter.x) * 2.2 + (pNose.x - shCenter.x) * 0.8;
   const kneeCenter = new THREE.Vector3().addVectors(pLKn, pRKn).multiplyScalar(0.5);
@@ -109,23 +129,23 @@ function computeReliableYaw(shDx, rawShDz, pNose, pLEye, pREye, shCenter, hipCen
   const dir2D = faceLookX + lowerBodyLeadX * 0.5;
   const sign2D = Math.abs(dir2D) > 0.008 ? Math.sign(dir2D) : 0;
 
-  // MODO DESBLOQUEADO (Cuando activas el checkbox/botón para que dé la vuelta completa):
   if (unlockRotation) {
-    // Si shDx < 0, los hombros izquierdo y derecho se cruzaron en pantalla (está de espaldas, > 90° hasta 180°)
-    const zYawUnclamped = -Math.atan2(rawShDz * 1.8, shDx);
-    const turnSign = sign2D !== 0 ? sign2D : (Math.sign(zYawUnclamped) || 1);
+    // atan2 suave con umbral mínimo en shDx para que no pegue un latigazo de 180° en 1 solo frame
+    const safeShDx = Math.abs(shDx) < 0.025 ? (shDx >= 0 ? 0.025 : -0.025) : shDx;
+    const zYawUnclamped = -Math.atan2(rawShDz * 1.6, safeShDx);
+    const prevSign = Math.abs(prevYaw) > 0.4 ? -Math.sign(prevYaw) : 0;
+    const turnSign = prevSign !== 0 && shWidth < 0.05 ? prevSign : (sign2D !== 0 ? sign2D : (Math.sign(zYawUnclamped) || 1));
 
     let fullAngle = Math.abs(zYawUnclamped);
-    if (shDx < 0) {
-      // Está de espaldas: garantizamos que pase de 90° (1.57 rad) hacia 180° (3.14 rad)
-      fullAngle = Math.max(fullAngle, Math.PI * 0.55 + profileRatio * 1.35);
+    if (shDx < -0.01) {
+      fullAngle = Math.max(fullAngle, Math.PI * 0.55 + profileRatio * 1.25);
     } else {
-      fullAngle = Math.max(fullAngle, profileRatio * 1.65);
+      fullAngle = Math.max(fullAngle, profileRatio * 1.55);
     }
-    return THREE.MathUtils.clamp(turnSign * fullAngle, -Math.PI, Math.PI);
+    const target = THREE.MathUtils.clamp(turnSign * fullAngle, -Math.PI, Math.PI);
+    return target;
   }
 
-  // MODO BLOQUEADO ORIGINAL (Estabilidad frontal clásica):
   const zYaw = -Math.atan2(rawShDz * 1.3, Math.max(0.06, shWidth * 1.3));
   const profileYawMag = profileRatio * 1.05;
   const yaw2D = sign2D !== 0 ? sign2D * profileYawMag : dir2D * 6.0;
@@ -137,7 +157,7 @@ function computeReliableYaw(shDx, rawShDz, pNose, pLEye, pREye, shCenter, hipCen
   return THREE.MathUtils.clamp(zYaw * 0.45 + yaw2D * 0.65, -1.3, 1.3);
 }
 
-// 1. MÓDULO DE CADERA (Con Detector de Desplazamiento + Salto + Candado de Rotación opcional)
+// 1. MÓDULO DE CADERA (Estabilizado para que no tuerza la cintura al girar)
 function solveHips(pLHip, pRHip, reliableTorsoYaw, screenLandmarks, mirrorSign, prevFrame, config) {
   const midX = (screenLandmarks[23]?.x + screenLandmarks[24]?.x) * 0.5 || 0.5;
   const midY = (screenLandmarks[23]?.y + screenLandmarks[24]?.y) * 0.5 || 0.5;
@@ -194,19 +214,21 @@ function solveHips(pLHip, pRHip, reliableTorsoYaw, screenLandmarks, mirrorSign, 
   const hipDx = pRHip.x - pLHip.x;
   const hipDy = pRHip.y - pLHip.y;
 
-  const hipRoll = Math.atan2(hipDy, Math.max(0.04, Math.abs(hipDx)));
-
-  // Si unlockRotation está activo, la cadera acompaña el 100% del giro hasta ±180° (Math.PI)
-  // Si está bloqueado, usa el 0.65 y el tope de ±0.95 rad (~54°)
   const isUnlocked = Boolean(config?.unlockRotation);
-  const hipYaw = isUnlocked ? reliableTorsoYaw * 0.95 : reliableTorsoYaw * 0.65;
+  const rawHipYaw = isUnlocked ? reliableTorsoYaw * 0.92 : reliableTorsoYaw * 0.65;
   const maxHipYaw = isUnlocked ? Math.PI : 0.95;
+  const clampedHipYaw = THREE.MathUtils.clamp(rawHipYaw, -maxHipYaw, maxHipYaw);
+
+  // REGLA ANTI-ROTURA 1: Cuando el personaje gira de perfil o de espaldas (|hipYaw| > 45°),
+  // reducimos el hipRoll lateral a cero para que la cadera no se incline ni quiebre la malla:
+  const frontalStability = Math.max(0, Math.cos(clampedHipYaw)); // 1 de frente, 0 en perfil/espaldas
+  const hipRoll = Math.atan2(hipDy, Math.max(0.06, Math.abs(hipDx))) * frontalStability;
 
   const hipsQuat = new THREE.Quaternion().setFromEuler(
     new THREE.Euler(
       0,
-      THREE.MathUtils.clamp(hipYaw, -maxHipYaw, maxHipYaw),
-      THREE.MathUtils.clamp(hipRoll * 0.75, -0.35, 0.35),
+      clampedHipYaw,
+      THREE.MathUtils.clamp(hipRoll * 0.70, -0.30, 0.30),
       'YXZ'
     )
   );
@@ -218,29 +240,46 @@ function solveHips(pLHip, pRHip, reliableTorsoYaw, screenLandmarks, mirrorSign, 
       0
     ],
     quat: sanitizeQuat(hipsQuat),
+    hipYaw: clampedHipYaw,
     baseHipY,
     baseFootY,
     originX
   };
 }
 
-// 2. MÓDULO DE DORSO Y PECHO
-function solveSpineAndChest(shCenter, hipCenter, pRSh, pLSh, reliableTorsoYaw, hipsQuat) {
+// 2. MÓDULO DE DORSO Y PECHO (Limitando la torsión máxima entre cadera y pecho)
+function solveSpineAndChest(shCenter, hipCenter, pRSh, pLSh, reliableTorsoYaw, hipsQuat, hipYaw) {
   const spineDir = new THREE.Vector3().subVectors(shCenter, hipCenter);
-  const spineRoll = -Math.atan2(spineDir.x, Math.max(0.05, Math.abs(spineDir.y)));
+
+  // Atenuar inclinaciones laterales de columna cuando está girando de perfil o de espaldas
+  const frontalWeight = Math.max(0.15, Math.abs(Math.cos(reliableTorsoYaw)));
+  const spineRoll = -Math.atan2(spineDir.x, Math.max(0.06, Math.abs(spineDir.y))) * frontalWeight;
 
   const shDx = pRSh.x - pLSh.x;
   const shDy = pRSh.y - pLSh.y;
 
-  const shRoll = Math.atan2(shDy, Math.max(0.05, Math.abs(shDx)));
-  const spinePitch = Math.atan2(spineDir.z, Math.max(0.06, Math.abs(spineDir.y))) * 0.8;
+  const shRoll = Math.atan2(shDy, Math.max(0.06, Math.abs(shDx))) * frontalWeight;
+  const spinePitch = THREE.MathUtils.clamp(
+    Math.atan2(spineDir.z, Math.max(0.06, Math.abs(spineDir.y))) * 0.75 * frontalWeight,
+    -0.38,
+    0.38
+  );
+
+  // REGLA ANTI-ROTURA 2: El pecho nunca puede torcerse más de ±45° (0.78 rad) respecto a la cadera
+  // para evitar que el torso quede mirando al frente mientras la cadera mira atrás (o viceversa):
+  const maxTwistDiff = 0.75;
+  const safeChestYaw = THREE.MathUtils.clamp(
+    reliableTorsoYaw,
+    hipYaw - maxTwistDiff,
+    hipYaw + maxTwistDiff
+  );
 
   const chestWorld = sanitizeQuat(
     new THREE.Quaternion().setFromEuler(
       new THREE.Euler(
         spinePitch,
-        reliableTorsoYaw,
-        THREE.MathUtils.clamp(spineRoll * 0.65 + shRoll * 0.45, -0.45, 0.45),
+        safeChestYaw,
+        THREE.MathUtils.clamp(spineRoll * 0.60 + shRoll * 0.40, -0.40, 0.40),
         'YXZ'
       )
     )
@@ -253,16 +292,19 @@ function solveSpineAndChest(shCenter, hipCenter, pRSh, pLSh, reliableTorsoYaw, h
 }
 
 // 3. MÓDULO DE CABEZA
-function solveHead(pNose, pLEye, pREye, chestQuat, config) {
+function solveHead(pNose, pLEye, pREye, chestQuat, reliableTorsoYaw, config) {
   const headGain = (config.headSensitivity ?? 1.0) * 0.6;
   const eyeDx = pREye.x - pLEye.x;
   const eyeDy = pREye.y - pLEye.y;
   const eyeCenter = new THREE.Vector3().addVectors(pLEye, pREye).multiplyScalar(0.5);
 
-  const eyeRollAngle = Math.atan2(eyeDy, Math.max(0.02, Math.abs(eyeDx)));
-  const localRoll = THREE.MathUtils.clamp(eyeRollAngle * headGain, -0.3, 0.3);
-  const localYaw = THREE.MathUtils.clamp(((pNose.x - eyeCenter.x) * 1.8) * headGain, -0.45, 0.45);
-  const localPitch = THREE.MathUtils.clamp((-(pNose.y - eyeCenter.y + 0.02) * 1.4) * headGain, -0.3, 0.3);
+  // Si está de espaldas, mantenemos la cabeza alineada con el pecho para que el cuello no se tuerza
+  const frontFactor = Math.max(0.15, Math.cos(reliableTorsoYaw));
+
+  const eyeRollAngle = Math.atan2(eyeDy, Math.max(0.03, Math.abs(eyeDx)));
+  const localRoll = THREE.MathUtils.clamp(eyeRollAngle * headGain * frontFactor, -0.28, 0.28);
+  const localYaw = THREE.MathUtils.clamp(((pNose.x - eyeCenter.x) * 1.8) * headGain * frontFactor, -0.45, 0.45);
+  const localPitch = THREE.MathUtils.clamp((-(pNose.y - eyeCenter.y + 0.02) * 1.4) * headGain * frontFactor, -0.28, 0.28);
 
   const localHeadOffset = sanitizeQuat(
     new THREE.Quaternion().setFromEuler(new THREE.Euler(localPitch, localYaw, localRoll, 'YXZ'))
@@ -488,13 +530,18 @@ function solveArms(
   };
 }
 
-// 5. MÓDULO DE PIERNAS
-function solveLegs(pLHip, pRHip, pLKn, pRKn, pLAn, pRAn, config, prevLegs) {
+// 5. MÓDULO DE PIERNAS ANTI-ROTURA EN GIROS (Rotan solidarias con la cadera sin invertirse de espaldas)
+function solveLegs(pLHip, pRHip, pLKn, pRKn, pLAn, pRAn, hipsQuat, hipYaw, config, prevLegs) {
   if (pLKn.y > pLHip.y - 0.03) pLKn.y = pLHip.y - 0.14;
   if (pRKn.y > pRHip.y - 0.03) pRKn.y = pRHip.y - 0.14;
 
-  // Si el límite de rotación está bloqueado (de frente), evitamos que las piernas se crucen
-  if (!config.unlockRotation && Math.abs(pLAn.y - pRAn.y) < 0.06) {
+  // Saber si la cadera mira al frente (cos > 0) o de espaldas (cos < 0)
+  const facingCos = Math.cos(hipYaw);
+  const facingSign = facingCos >= 0 ? 1 : -1;
+  const isTurned = Math.abs(hipYaw) > 0.65; // Más de ~37° de giro
+
+  // Candado anti-cruce en pantalla SOLO cuando mira hacia el frente
+  if (!isTurned && Math.abs(pLAn.y - pRAn.y) < 0.06) {
     if (pLKn.x > pRKn.x) {
       const midX = (pLKn.x + pRKn.x) * 0.5;
       pLKn.x = midX - 0.02;
@@ -507,40 +554,71 @@ function solveLegs(pLHip, pRHip, pLKn, pRKn, pLAn, pRAn, config, prevLegs) {
     }
   }
 
-  pLKn.z = Math.min(-0.02, pLKn.z * 0.5);
-  pRKn.z = Math.min(-0.02, pRKn.z * 0.5);
+  // Construimos los vectores de muslo y pantorrilla en el ESPACIO LOCAL DE LA CADERA:
+  // Así -Z siempre es "hacia adelante de la rodilla del personaje" y +Z es "hacia atrás de su talón",
+  // aunque el personaje esté de perfil o 100% de espaldas (como en tus capturas de Ai chan).
+  const buildLocalLegVectors = (pHip, pKn, pAn, isLeft, liftAmount) => {
+    const sideSign = isLeft ? -1 : 1;
 
-  pLAn.z = Math.max(pLKn.z + 0.02, pLAn.z * 0.5);
-  pRAn.z = Math.max(pRKn.z + 0.02, pRAn.z * 0.5);
+    // Si está girado de espaldas (facingSign < 0), invertimos X para que las piernas no se crucen en tijera
+    let thighDx = (pKn.x - pHip.x) * facingSign;
+    let calfDx = (pAn.x - pKn.x) * facingSign;
+
+    // Durante un giro fuerte (> 45°), limitamos cuánto puede cruzarse una pierna hacia el lado opuesto
+    if (isTurned) {
+      if (thighDx * sideSign < -0.02) thighDx = sideSign * -0.02;
+      if (calfDx * sideSign < -0.03) calfDx = sideSign * -0.03;
+      thighDx *= 0.65;
+      calfDx *= 0.65;
+    }
+
+    const thighDy = Math.min(-0.04, pKn.y - pHip.y);
+    const calfDy = Math.min(-0.04, pAn.y - pKn.y);
+
+    // En espacio local del personaje: -Z siempre apunta hacia adelante (rodilla) y +Z hacia atrás (talón)
+    let thighDz = Math.min(-0.02, (pKn.z - pHip.z) * 0.35 * facingSign);
+    let calfDz = Math.max(0.03, (pAn.z - pKn.z) * 0.35 * facingSign);
+
+    if (liftAmount > 0.035) {
+      thighDz -= liftAmount * 0.45; // Adelanta la rodilla hacia el frente del personaje
+      calfDz += liftAmount * 0.90;  // Dobla el talón hacia atrás del personaje
+    }
+
+    return {
+      thighVec: new THREE.Vector3(thighDx, thighDy, thighDz),
+      calfVec: new THREE.Vector3(calfDx, calfDy, calfDz)
+    };
+  };
 
   const lLift = Math.max(0, pLAn.y - pRAn.y);
   const rLift = Math.max(0, pRAn.y - pLAn.y);
 
-  if (lLift > 0.04) {
-    pLKn.z -= lLift * 0.45;
-    pLAn.z = pLKn.z + lLift * 0.95;
-  }
-  if (rLift > 0.04) {
-    pRKn.z -= rLift * 0.45;
-    pRAn.z = pRKn.z + rLift * 0.95;
-  }
+  const leftVecs = buildLocalLegVectors(pLHip, pLKn, pLAn, true, lLift);
+  const rightVecs = buildLocalLegVectors(pRHip, pRKn, pRAn, false, rLift);
 
   const legSpreadRad = THREE.MathUtils.degToRad(config.legSpreadOffset || 0);
   const lLegBias = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), -legSpreadRad);
   const rLegBias = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), legSpreadRad);
 
-  const lUpper = getVecQuat(pLHip, pLKn, T_POSE_DIRS.leftUpperLeg, 1.4).multiply(lLegBias);
-  const lLower = getVecQuat(pLKn, pLAn, T_POSE_DIRS.leftLowerLeg, 1.85);
-  const rUpper = getVecQuat(pRHip, pRKn, T_POSE_DIRS.rightUpperLeg, 1.4).multiply(rLegBias);
-  const rLower = getVecQuat(pRKn, pRAn, T_POSE_DIRS.rightLowerLeg, 1.85);
+  const zero = new THREE.Vector3(0, 0, 0);
+  const lUpperLocal = getVecQuat(zero, leftVecs.thighVec, T_POSE_DIRS.leftUpperLeg, 1.35).multiply(lLegBias);
+  const lLowerLocal = getVecQuat(zero, leftVecs.calfVec, T_POSE_DIRS.leftLowerLeg, 1.80);
+  const rUpperLocal = getVecQuat(zero, rightVecs.thighVec, T_POSE_DIRS.rightUpperLeg, 1.35).multiply(rLegBias);
+  const rLowerLocal = getVecQuat(zero, rightVecs.calfVec, T_POSE_DIRS.rightLowerLeg, 1.80);
+
+  // Multiplicamos por hipsQuat para que las piernas roten 100% solidarias con la cadera sin torcerse jamás
+  const lUpper = sanitizeQuat(hipsQuat.clone().multiply(lUpperLocal));
+  const lLower = sanitizeQuat(hipsQuat.clone().multiply(lLowerLocal));
+  const rUpper = sanitizeQuat(hipsQuat.clone().multiply(rUpperLocal));
+  const rLower = sanitizeQuat(hipsQuat.clone().multiply(rLowerLocal));
 
   return {
     leftUpperLeg: prevLegs?.leftUpperLeg ? prevLegs.leftUpperLeg.clone().slerp(lUpper, 0.7) : lUpper,
     leftLowerLeg: prevLegs?.leftLowerLeg ? prevLegs.leftLowerLeg.clone().slerp(lLower, 0.7) : lLower,
-    leftFoot: new THREE.Quaternion(0, 0, 0, 1),
+    leftFoot: hipsQuat.clone(),
     rightUpperLeg: prevLegs?.rightUpperLeg ? prevLegs.rightUpperLeg.clone().slerp(rUpper, 0.7) : rUpper,
     rightLowerLeg: prevLegs?.rightLowerLeg ? prevLegs.rightLowerLeg.clone().slerp(rLower, 0.7) : rLower,
-    rightFoot: new THREE.Quaternion(0, 0, 0, 1)
+    rightFoot: hipsQuat.clone()
   };
 }
 
@@ -566,7 +644,7 @@ function getVecQuat(pStart, pEnd, restDir, maxAngle = 2.4) {
 
 export function solvePoseToVRM(worldLandmarks, screenLandmarks, prevFrame, config, videoAspect = 0.6) {
   if (!screenLandmarks || screenLandmarks.length === 0) {
-    return prevFrame || { hipsPos: [0, 0, 0], localQuats: {}, worldQuats: {} };
+    return prevFrame || { hipsPos: [0, 0, 0], localQuats: {}, worldQuats: {}, torsoYaw: 0 };
   }
 
   const mirrorSign = config.mirror ? -1 : 1;
@@ -597,7 +675,7 @@ export function solvePoseToVRM(worldLandmarks, screenLandmarks, prevFrame, confi
   const hipCenter = new THREE.Vector3().addVectors(pLHip, pRHip).multiplyScalar(0.5);
   const shCenter = new THREE.Vector3().addVectors(pLSh, pRSh).multiplyScalar(0.5);
 
-  const reliableTorsoYaw = -computeReliableYaw(
+  const rawTorsoYaw = -computeReliableYaw(
     pRSh.x - pLSh.x,
     rawShDz,
     pNose,
@@ -607,12 +685,18 @@ export function solvePoseToVRM(worldLandmarks, screenLandmarks, prevFrame, confi
     hipCenter,
     pLKn,
     pRKn,
-    Boolean(config.unlockRotation)
+    Boolean(config.unlockRotation),
+    prevFrame?.torsoYaw ?? 0
   );
 
+  // Desempaquetar y suavizar el ángulo de giro para evitar saltos bruscos de +180° a -180°
+  const prevYaw = prevFrame?.torsoYaw ?? rawTorsoYaw;
+  const unwrappedYaw = unwrapAngle(rawTorsoYaw, prevYaw);
+  const reliableTorsoYaw = prevYaw + (unwrappedYaw - prevYaw) * 0.35;
+
   const hipsData = solveHips(pLHip, pRHip, reliableTorsoYaw, screenLandmarks, mirrorSign, prevFrame, config);
-  const torsoData = solveSpineAndChest(shCenter, hipCenter, pRSh, pLSh, reliableTorsoYaw, hipsData.quat);
-  const headData = solveHead(pNose, pLEye, pREye, torsoData.chest, config);
+  const torsoData = solveSpineAndChest(shCenter, hipCenter, pRSh, pLSh, reliableTorsoYaw, hipsData.quat, hipsData.hipYaw);
+  const headData = solveHead(pNose, pLEye, pREye, torsoData.chest, reliableTorsoYaw, config);
   const armsData = solveArms(
     pLSh, pRSh, pLEl, pREl, pLWr, pRWr,
     pLPinky, pRPinky, pLIndex, pRIndex,
@@ -631,7 +715,18 @@ export function solvePoseToVRM(worldLandmarks, screenLandmarks, prevFrame, confi
     rightLowerLeg: sanitizeQuat(new THREE.Quaternion(...prevFrame.worldQuats.rightLowerLeg))
   } : null;
 
-  const legsData = solveLegs(pLHip, pRHip, pLKn, pRKn, pLAn, pRAn, config, prevLegQuats);
+  const legsData = solveLegs(
+    pLHip,
+    pRHip,
+    pLKn,
+    pRKn,
+    pLAn,
+    pRAn,
+    hipsData.quat,
+    hipsData.hipYaw,
+    config,
+    prevLegQuats
+  );
 
   const worldQuats = {
     hips: hipsData.quat,
@@ -674,6 +769,10 @@ export function solvePoseToVRM(worldLandmarks, screenLandmarks, prevFrame, confi
     if (prevFrame && prevFrame.localQuats && prevFrame.localQuats[bone]) {
       const filteredQ = applyQuatDeadzone(localQuats[bone], prevFrame.localQuats[bone], 0.008);
       const prevQ = sanitizeQuat(new THREE.Quaternion(...prevFrame.localQuats[bone]));
+      // Asegurar hemisferio corto antes del slerp para que los giros de 180° no inviertan el hueso
+      if (prevQ.dot(filteredQ) < 0) {
+        filteredQ.set(-filteredQ.x, -filteredQ.y, -filteredQ.z, -filteredQ.w);
+      }
       prevQ.slerp(filteredQ, 1 - (config.smoothing ?? 0.2));
       localQuats[bone].copy(sanitizeQuat(prevQ));
     }
@@ -695,6 +794,7 @@ export function solvePoseToVRM(worldLandmarks, screenLandmarks, prevFrame, confi
     hipsPos: finalHipsPos,
     localQuats: serializedLocal,
     worldQuats: serializedWorld,
+    torsoYaw: reliableTorsoYaw,
     baseHipY: hipsData.baseHipY,
     baseFootY: hipsData.baseFootY,
     originX: hipsData.originX
