@@ -119,7 +119,8 @@ export default function App() {
     depthScale: 0.3,
     hipMoveScale: 0.7,
     invertArmZ: false,
-    invertShoulderZ: false
+    invertShoulderZ: false,
+    unlockRotation: false
   });
 
   const videoRef = useRef(null);
@@ -481,6 +482,73 @@ export default function App() {
     applySolvedPose(prevPoseRef.current, {});
     setCopyFeedback('🔄 Todos los huesos reseteados a 0°');
     setTimeout(() => setCopyFeedback(''), 2000);
+  };
+
+  // Pasa un filtro de suavizado temporal (ventana móvil) sobre los frames ya grabados
+  // para eliminar picos de ruido o temblores sin perder el ritmo del baile
+  const applyPostSmoothingToFrames = (passes = 2) => {
+    if (recordedFrames.length < 3) return;
+
+    let current = recordedFrames.map((f) => ({
+      ...f,
+      hipsPos: [...(f.hipsPos || [0, 0, 0])],
+      rawHipsPos: [...(f.rawHipsPos || f.hipsPos || [0, 0, 0])],
+      localQuats: { ...(f.localQuats || {}) },
+      rawLocalQuats: { ...(f.rawLocalQuats || f.localQuats || {}) }
+    }));
+
+    const blendFactor = THREE.MathUtils.clamp(config.smoothing || 0.35, 0.15, 0.75);
+
+    for (let p = 0; p < passes; p++) {
+      const next = current.map((f) => ({
+        ...f,
+        hipsPos: [...f.hipsPos],
+        rawHipsPos: [...f.rawHipsPos],
+        localQuats: { ...f.localQuats },
+        rawLocalQuats: { ...f.rawLocalQuats }
+      }));
+
+      for (let i = 1; i < current.length - 1; i++) {
+        const prevF = current[i - 1];
+        const currF = current[i];
+        const nextF = current[i + 1];
+
+        for (let axis = 0; axis < 3; axis++) {
+          const avgPos = (prevF.rawHipsPos[axis] + nextF.rawHipsPos[axis]) * 0.5;
+          next[i].rawHipsPos[axis] = currF.rawHipsPos[axis] * (1 - blendFactor) + avgPos * blendFactor;
+          next[i].hipsPos[axis] = next[i].rawHipsPos[axis];
+        }
+
+        BONE_LIST.forEach((bName) => {
+          const qPrev = new THREE.Quaternion(...(prevF.rawLocalQuats[bName] || [0, 0, 0, 1]));
+          const qCurr = new THREE.Quaternion(...(currF.rawLocalQuats[bName] || [0, 0, 0, 1]));
+          const qNext = new THREE.Quaternion(...(nextF.rawLocalQuats[bName] || [0, 0, 0, 1]));
+
+          if (qPrev.dot(qNext) < 0) {
+            qNext.set(-qNext.x, -qNext.y, -qNext.z, -qNext.w);
+          }
+          const qMid = qPrev.clone().slerp(qNext, 0.5).normalize();
+
+          if (qCurr.dot(qMid) < 0) {
+            qMid.set(-qMid.x, -qMid.y, -qMid.z, -qMid.w);
+          }
+          qCurr.slerp(qMid, blendFactor).normalize();
+
+          const arr = [qCurr.x, qCurr.y, qCurr.z, qCurr.w];
+          next[i].rawLocalQuats[bName] = arr;
+          next[i].localQuats[bName] = arr;
+        });
+      }
+      current = next;
+    }
+
+    setRecordedFrames(current);
+    setExportLogs((prev) => [
+      ...prev,
+      `✨ Ruido suavizado en ${current.length} frames (Intensidad: ${Math.round((config.smoothing || 0.2) * 100)}%).`
+    ]);
+    setCopyFeedback('✨ ¡Animación suavizada!');
+    setTimeout(() => setCopyFeedback(''), 2500);
   };
 
   useEffect(() => {
@@ -896,6 +964,80 @@ export default function App() {
                 Velocidad {rate}x
               </button>
             ))}
+          </div>
+
+       {/* Checkbox / Botón rápido para Desbloquear o Bloquear el Límite de Rotación en vivo */}
+       <div
+         onClick={() => setConfig((prev) => ({ ...prev, unlockRotation: !prev.unlockRotation }))}
+         style={{
+           marginTop: '8px',
+           padding: '10px 12px',
+           borderRadius: '10px',
+           cursor: 'pointer',
+           display: 'flex',
+           alignItems: 'center',
+           justifyContent: 'space-between',
+           background: config.unlockRotation ? '#3b0764' : '#1e293b',
+           border: config.unlockRotation ? '1px solid #c084fc' : '1px solid #334155',
+           transition: 'all 0.15s ease'
+         }}
+       >
+         <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', fontWeight: 700, color: config.unlockRotation ? '#e9d5ff' : '#cbd5e1', cursor: 'pointer', pointerEvents: 'none' }}>
+           <input
+             type="checkbox"
+             checked={Boolean(config.unlockRotation)}
+             readOnly
+             style={{ width: '16px', height: '16px', accentColor: '#a855f7' }}
+           />
+           {config.unlockRotation
+             ? '🔓 Giro 360° DESBLOQUEADO (Toca para bloquear)'
+             : '🔒 Límite de Rotación Bloqueado (Toca para giro 360°)'}
+         </label>
+         <span style={{ fontSize: '11px', padding: '3px 8px', borderRadius: '6px', background: config.unlockRotation ? '#9333ea' : '#334155', color: '#fff', fontWeight: 600 }}>
+           {config.unlockRotation ? '360° LIBRE' : 'FRENTE FIJO'}
+         </span>
+       </div>
+
+          
+
+          {/* Control de Suavizado Anti-Ruido (En vivo + Post-grabación) */}
+          <div style={{ marginTop: '10px', padding: '10px', background: '#141724', borderRadius: '10px', border: '1px solid #2e344d' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', fontSize: '12px', marginBottom: '6px' }}>
+              <span style={{ color: '#38bdf8', fontWeight: 700 }}>
+                🌊 Suavizar Ruido (Filtro): {Math.round((config.smoothing ?? 0.2) * 100)}%
+              </span>
+              <span style={{ color: '#94a3b8', fontSize: '11px' }}>
+                {(config.smoothing ?? 0.2) < 0.25
+                  ? '⚡ Rápido'
+                  : (config.smoothing ?? 0.2) < 0.55
+                  ? '⚖️ Equilibrado'
+                  : '🧈 Súper Suave'}
+              </span>
+            </div>
+
+            <input
+              type="range"
+              min="0.05"
+              max="0.85"
+              step="0.05"
+              value={config.smoothing ?? 0.20}
+              onChange={(e) => {
+                const val = parseFloat(e.target.value);
+                setConfig((prev) => ({ ...prev, smoothing: val }));
+              }}
+              style={{ width: '100%', accentColor: '#38bdf8', cursor: 'pointer' }}
+            />
+
+            <div className="mp-btn-row" style={{ marginTop: '6px' }}>
+              <button
+                className="mp-btn"
+                style={{ background: '#0ea5e9', padding: '7px', fontSize: '12px' }}
+                disabled={recordedFrames.length < 3}
+                onClick={() => applyPostSmoothingToFrames(2)}
+              >
+                ✨ Pulir Ruido de Frames Grabados ({recordedFrames.length}f)
+              </button>
+            </div>
           </div>
 
           <div className="mp-angle-bar">

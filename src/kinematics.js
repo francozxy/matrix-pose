@@ -97,7 +97,7 @@ function applyQuatDeadzone(currQ, prevQArray, threshold = 0.008) {
   return currQ;
 }
 
-function computeReliableYaw(shDx, rawShDz, pNose, pLEye, pREye, shCenter, hipCenter, pLKn, pRKn) {
+function computeReliableYaw(shDx, rawShDz, pNose, pLEye, pREye, shCenter, hipCenter, pLKn, pRKn, unlockRotation = false) {
   const eyeCenter = new THREE.Vector3().addVectors(pLEye, pREye).multiplyScalar(0.5);
   const faceLookX = (pNose.x - eyeCenter.x) * 2.2 + (pNose.x - shCenter.x) * 0.8;
   const kneeCenter = new THREE.Vector3().addVectors(pLKn, pRKn).multiplyScalar(0.5);
@@ -109,6 +109,23 @@ function computeReliableYaw(shDx, rawShDz, pNose, pLEye, pREye, shCenter, hipCen
   const dir2D = faceLookX + lowerBodyLeadX * 0.5;
   const sign2D = Math.abs(dir2D) > 0.008 ? Math.sign(dir2D) : 0;
 
+  // MODO DESBLOQUEADO (Cuando activas el checkbox/botón para que dé la vuelta completa):
+  if (unlockRotation) {
+    // Si shDx < 0, los hombros izquierdo y derecho se cruzaron en pantalla (está de espaldas, > 90° hasta 180°)
+    const zYawUnclamped = -Math.atan2(rawShDz * 1.8, shDx);
+    const turnSign = sign2D !== 0 ? sign2D : (Math.sign(zYawUnclamped) || 1);
+
+    let fullAngle = Math.abs(zYawUnclamped);
+    if (shDx < 0) {
+      // Está de espaldas: garantizamos que pase de 90° (1.57 rad) hacia 180° (3.14 rad)
+      fullAngle = Math.max(fullAngle, Math.PI * 0.55 + profileRatio * 1.35);
+    } else {
+      fullAngle = Math.max(fullAngle, profileRatio * 1.65);
+    }
+    return THREE.MathUtils.clamp(turnSign * fullAngle, -Math.PI, Math.PI);
+  }
+
+  // MODO BLOQUEADO ORIGINAL (Estabilidad frontal clásica):
   const zYaw = -Math.atan2(rawShDz * 1.3, Math.max(0.06, shWidth * 1.3));
   const profileYawMag = profileRatio * 1.05;
   const yaw2D = sign2D !== 0 ? sign2D * profileYawMag : dir2D * 6.0;
@@ -120,24 +137,75 @@ function computeReliableYaw(shDx, rawShDz, pNose, pLEye, pREye, shCenter, hipCen
   return THREE.MathUtils.clamp(zYaw * 0.45 + yaw2D * 0.65, -1.3, 1.3);
 }
 
-// 1. MÓDULO DE CADERA
-function solveHips(pLHip, pRHip, reliableTorsoYaw, screenLandmarks, mirrorSign, prevPos) {
+// 1. MÓDULO DE CADERA (Con Detector de Desplazamiento + Salto + Candado de Rotación opcional)
+function solveHips(pLHip, pRHip, reliableTorsoYaw, screenLandmarks, mirrorSign, prevFrame, config) {
   const midX = (screenLandmarks[23]?.x + screenLandmarks[24]?.x) * 0.5 || 0.5;
   const midY = (screenLandmarks[23]?.y + screenLandmarks[24]?.y) * 0.5 || 0.5;
 
-  const dx = applyDeadzone((midX - 0.5) * mirrorSign * 0.6, prevPos?.[0], 0.003);
-  const dy = applyDeadzone((0.50 - midY) * 0.5, prevPos?.[1], 0.003);
+  const lAnkX = screenLandmarks[27]?.x ?? midX;
+  const rAnkX = screenLandmarks[28]?.x ?? midX;
+  const feetMidX = (lAnkX + rAnkX) * 0.5;
+
+  const lAnkY = screenLandmarks[27]?.y ?? 0.85;
+  const rAnkY = screenLandmarks[28]?.y ?? 0.85;
+  const lowestFootScreenY = Math.max(lAnkY, rAnkY);
+
+  const bodyCenterX = midX * 0.65 + feetMidX * 0.35;
+  const prevOriginX = prevFrame?.originX ?? bodyCenterX;
+  const originX = prevOriginX * 0.998 + bodyCenterX * 0.002;
+
+  const prevBaseHipY = prevFrame?.baseHipY ?? midY;
+  const prevBaseFootY = prevFrame?.baseFootY ?? lowestFootScreenY;
+
+  const baseFootY =
+    lowestFootScreenY >= prevBaseFootY
+      ? prevBaseFootY * 0.85 + lowestFootScreenY * 0.15
+      : prevBaseFootY * 0.992 + lowestFootScreenY * 0.008;
+
+  const isFeetOnGround = (baseFootY - lowestFootScreenY) < 0.035;
+  const baseHipY = isFeetOnGround
+    ? prevBaseHipY * 0.92 + midY * 0.08
+    : prevBaseHipY;
+
+  const moveScale = config?.hipMoveScale ?? 0.7;
+
+  const hipShiftX = (midX - originX) * mirrorSign;
+  const feetShiftX = (feetMidX - originX) * mirrorSign;
+
+  const isSteppingSideways =
+    Math.sign(hipShiftX) === Math.sign(feetShiftX) && Math.abs(feetShiftX) > 0.02;
+
+  let rawDx = (hipShiftX * 0.65 + feetShiftX * 0.35) * (1.75 * moveScale);
+  if (isSteppingSideways) {
+    rawDx += feetShiftX * (0.95 * moveScale);
+  }
+
+  const hipRise = baseHipY - midY;
+  const feetLift = Math.max(0, baseFootY - lowestFootScreenY);
+
+  let rawDy = hipRise * (1.15 * moveScale);
+  if (hipRise > 0.015 && feetLift > 0.015) {
+    rawDy += feetLift * 1.35;
+  }
+
+  const dx = applyDeadzone(rawDx, prevFrame?.hipsPos?.[0], 0.0025);
+  const dy = applyDeadzone(rawDy, prevFrame?.hipsPos?.[1], 0.003);
 
   const hipDx = pRHip.x - pLHip.x;
   const hipDy = pRHip.y - pLHip.y;
 
   const hipRoll = Math.atan2(hipDy, Math.max(0.04, Math.abs(hipDx)));
-  const hipYaw = reliableTorsoYaw * 0.65;
+
+  // Si unlockRotation está activo, la cadera acompaña el 100% del giro hasta ±180° (Math.PI)
+  // Si está bloqueado, usa el 0.65 y el tope de ±0.95 rad (~54°)
+  const isUnlocked = Boolean(config?.unlockRotation);
+  const hipYaw = isUnlocked ? reliableTorsoYaw * 0.95 : reliableTorsoYaw * 0.65;
+  const maxHipYaw = isUnlocked ? Math.PI : 0.95;
 
   const hipsQuat = new THREE.Quaternion().setFromEuler(
     new THREE.Euler(
       0,
-      THREE.MathUtils.clamp(hipYaw, -0.95, 0.95),
+      THREE.MathUtils.clamp(hipYaw, -maxHipYaw, maxHipYaw),
       THREE.MathUtils.clamp(hipRoll * 0.75, -0.35, 0.35),
       'YXZ'
     )
@@ -145,11 +213,14 @@ function solveHips(pLHip, pRHip, reliableTorsoYaw, screenLandmarks, mirrorSign, 
 
   return {
     pos: [
-      Number.isFinite(dx) ? THREE.MathUtils.clamp(dx, -0.35, 0.35) : 0,
-      Number.isFinite(dy) ? THREE.MathUtils.clamp(dy, -0.25, 0.18) : 0,
+      Number.isFinite(dx) ? THREE.MathUtils.clamp(dx, -1.35, 1.35) : 0,
+      Number.isFinite(dy) ? THREE.MathUtils.clamp(dy, -0.35, 0.55) : 0,
       0
     ],
-    quat: sanitizeQuat(hipsQuat)
+    quat: sanitizeQuat(hipsQuat),
+    baseHipY,
+    baseFootY,
+    originX
   };
 }
 
@@ -417,13 +488,13 @@ function solveArms(
   };
 }
 
-// 5. MÓDULO DE PIERNAS DEL VIDEO DE 53s (Con signo Z corregido para que la rodilla apunte adelante y el talón atrás)
+// 5. MÓDULO DE PIERNAS
 function solveLegs(pLHip, pRHip, pLKn, pRKn, pLAn, pRAn, config, prevLegs) {
   if (pLKn.y > pLHip.y - 0.03) pLKn.y = pLHip.y - 0.14;
   if (pRKn.y > pRHip.y - 0.03) pRKn.y = pRHip.y - 0.14;
 
-  // Candado anti-cruce suave solo cuando ambos pies están apoyados a nivel similar
-  if (Math.abs(pLAn.y - pRAn.y) < 0.06) {
+  // Si el límite de rotación está bloqueado (de frente), evitamos que las piernas se crucen
+  if (!config.unlockRotation && Math.abs(pLAn.y - pRAn.y) < 0.06) {
     if (pLKn.x > pRKn.x) {
       const midX = (pLKn.x + pRKn.x) * 0.5;
       pLKn.x = midX - 0.02;
@@ -436,25 +507,18 @@ function solveLegs(pLHip, pRHip, pLKn, pRKn, pLAn, pRAn, config, prevLegs) {
     }
   }
 
-  // CORRECCIÓN PUNTUAL SOBRE TU VERSIÓN DE 53s:
-  // Antes tenías: pLKn.z = Math.max(0.02, pLKn.z) y pLAn.z = Math.min(pLKn.z - 0.02, pLAn.z)
-  // En el espacio VRM de Deelia, -Z es hacia ADELANTE (frente) y +Z es hacia ATRÁS (espalda).
-  // Por lo tanto, la rodilla nunca debe irse a +Z (atrás de la cadera) y el tobillo siempre debe
-  // estar igual o más hacia +Z (atrás) que la rodilla para que jamás se quiebre como flamenco:
   pLKn.z = Math.min(-0.02, pLKn.z * 0.5);
   pRKn.z = Math.min(-0.02, pRKn.z * 0.5);
 
   pLAn.z = Math.max(pLKn.z + 0.02, pLAn.z * 0.5);
   pRAn.z = Math.max(pRKn.z + 0.02, pRAn.z * 0.5);
 
-  // Si levanta mucho un pie (como en el segundo 00:02 o 00:13), adelantamos esa rodilla hacia el frente (-Z)
-  // y llevamos su tobillo hacia atrás (+Z) de forma proporcional a cuánto subió el pie:
   const lLift = Math.max(0, pLAn.y - pRAn.y);
   const rLift = Math.max(0, pRAn.y - pLAn.y);
 
   if (lLift > 0.04) {
-    pLKn.z -= lLift * 0.45; // Rodilla hacia adelante
-    pLAn.z = pLKn.z + lLift * 0.95; // Talón hacia atrás
+    pLKn.z -= lLift * 0.45;
+    pLAn.z = pLKn.z + lLift * 0.95;
   }
   if (rLift > 0.04) {
     pRKn.z -= rLift * 0.45;
@@ -542,10 +606,11 @@ export function solvePoseToVRM(worldLandmarks, screenLandmarks, prevFrame, confi
     shCenter,
     hipCenter,
     pLKn,
-    pRKn
+    pRKn,
+    Boolean(config.unlockRotation)
   );
 
-  const hipsData = solveHips(pLHip, pRHip, reliableTorsoYaw, screenLandmarks, mirrorSign, prevFrame?.hipsPos);
+  const hipsData = solveHips(pLHip, pRHip, reliableTorsoYaw, screenLandmarks, mirrorSign, prevFrame, config);
   const torsoData = solveSpineAndChest(shCenter, hipCenter, pRSh, pLSh, reliableTorsoYaw, hipsData.quat);
   const headData = solveHead(pNose, pLEye, pREye, torsoData.chest, config);
   const armsData = solveArms(
@@ -629,6 +694,9 @@ export function solvePoseToVRM(worldLandmarks, screenLandmarks, prevFrame, confi
   return {
     hipsPos: finalHipsPos,
     localQuats: serializedLocal,
-    worldQuats: serializedWorld
+    worldQuats: serializedWorld,
+    baseHipY: hipsData.baseHipY,
+    baseFootY: hipsData.baseFootY,
+    originX: hipsData.originX
   };
 }
