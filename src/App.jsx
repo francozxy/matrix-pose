@@ -3,7 +3,7 @@ import React, { useState, useRef, useEffect } from 'react';
 import * as THREE from 'three';
 import { GLTFLoader } from 'three/examples/jsm/loaders/GLTFLoader.js';
 import { VRMLoaderPlugin, VRMUtils } from '@pixiv/three-vrm';
-import { solvePoseToVRM, BONE_LIST } from './kinematics';
+import { solvePoseToVRM, BONE_LIST, FINGER_BONE_LIST } from './kinematics';
 import { buildVRMABinary, buildVMDBinary, bakeOffsetsIntoFrames } from './exporters';
 import PosingPanel from './components/PosingPanel';
 import CanvasViewer from './components/CanvasViewer';
@@ -82,6 +82,8 @@ function loadMediaPipePoseScript() {
 const POSE_CONNECTIONS = [
   [0, 2], [0, 5], [2, 5], [9, 10],
   [11, 12], [11, 13], [13, 15], [12, 14], [14, 16],
+  [15, 17], [15, 19], [15, 21], [17, 19],
+  [16, 18], [16, 20], [16, 22], [18, 20],
   [11, 23], [12, 24], [23, 24],
   [23, 25], [25, 27], [24, 26], [26, 28]
 ];
@@ -120,13 +122,21 @@ export default function App() {
     hipMoveScale: 0.7,
     invertArmZ: false,
     invertShoulderZ: false,
-    unlockRotation: false
+    unlockRotation: false,
+    faceTrackingEnabled: true,
+    faceExpressionPreset: 'auto',
+    fingerTrackingEnabled: true,
+    fingerPreset: 'auto',
+    fingerCurlSensitivity: 1.0,
+    highLegBoost: false,
+    headLookAtCamera: true,
+    moveEnabled: true,
+    moveDepthEnabled: false,
+    armStability: 0.6
   });
-
 
   const [videoCurrentTime, setVideoCurrentTime] = useState(0);
   const [videoDuration, setVideoDuration] = useState(0);
-
 
   const videoRef = useRef(null);
   const canvas2DRef = useRef(null);
@@ -146,6 +156,33 @@ export default function App() {
   useEffect(() => { vrmListRef.current = vrmList; }, [vrmList]);
   useEffect(() => { activeVrmIndexRef.current = activeVrmIndex; }, [activeVrmIndex]);
   useEffect(() => { boneOffsetsRef.current = boneOffsets; }, [boneOffsets]);
+
+  const applyFacialExpressions = (vrm, expressions) => {
+    if (!vrm) return;
+    const exp = expressions || { blink: 0, mouthOpen: 0, smile: 0, relaxed: 0 };
+
+    const setWeight = (vrm1Name, vrm0Name, val) => {
+      const clamped = THREE.MathUtils.clamp(val || 0, 0, 1);
+      if (vrm.expressionManager) {
+        vrm.expressionManager.setValue(vrm1Name, clamped);
+      } else if (vrm.blendShapeProxy) {
+        vrm.blendShapeProxy.setValue(vrm0Name, clamped);
+      }
+    };
+
+    try {
+      setWeight('blink', 'Blink', exp.blink);
+      setWeight('aa', 'A', exp.mouthOpen);
+      setWeight('happy', 'Joy', exp.smile);
+      setWeight('relaxed', 'Fun', exp.relaxed);
+
+      if (vrm.expressionManager?.update) {
+        vrm.expressionManager.update();
+      } else if (vrm.blendShapeProxy?.update) {
+        vrm.blendShapeProxy.update();
+      }
+    } catch (e) {}
+  };
 
   const applySolvedPose = (solved, customOffsetsOverride = null) => {
     const currentAvatar = vrmListRef.current?.[activeVrmIndexRef.current];
@@ -200,7 +237,15 @@ export default function App() {
         finalQuats[boneName] = node.quaternion.toArray();
       });
 
-      return { hipsPos: finalHipsPos, localQuats: finalQuats };
+      if (solved?.expressions) {
+        applyFacialExpressions(loadedVrm, solved.expressions);
+      }
+
+      return {
+        hipsPos: finalHipsPos,
+        localQuats: finalQuats,
+        expressions: solved?.expressions || { blink: 0, mouthOpen: 0, smile: 0, relaxed: 0 }
+      };
     } catch (err) {
       console.error('Error aplicando pose:', err);
       return null;
@@ -265,7 +310,6 @@ export default function App() {
     applySolvedPose(prevPoseRef.current, updatedOffsets);
   };
 
-  // Cargar automáticamente el último VRM guardado en IndexedDB al abrir la app
   useEffect(() => {
     loadVrmFromIndexedDB().then((saved) => {
       if (saved && saved.blob) {
@@ -336,7 +380,6 @@ export default function App() {
     const file = e.target.files?.[0];
     if (!file) return;
 
-    // Guardar en IndexedDB para persistencia sin límite de tamaño
     saveVrmToIndexedDB(file, file.name);
 
     const url = URL.createObjectURL(file);
@@ -378,6 +421,7 @@ export default function App() {
       }
 
       const frame = baked[idx];
+      const rawOrigFrame = recordedFrames[idx];
       const currentAvatar = vrmListRef.current?.[activeVrmIndexRef.current];
       const humanoid = currentAvatar?.vrm?.humanoid;
       if (humanoid) {
@@ -391,6 +435,9 @@ export default function App() {
             node.quaternion.fromArray(frame.localQuats[bName]);
           }
         });
+        if (rawOrigFrame?.expressions) {
+          applyFacialExpressions(currentAvatar.vrm, rawOrigFrame.expressions);
+        }
       }
       idx++;
     }, 33);
@@ -489,8 +536,6 @@ export default function App() {
     setTimeout(() => setCopyFeedback(''), 2000);
   };
 
-  // Pasa un filtro de suavizado temporal (ventana móvil) sobre los frames ya grabados
-  // para eliminar picos de ruido o temblores sin perder el ritmo del baile
   const applyPostSmoothingToFrames = (passes = 2) => {
     if (recordedFrames.length < 3) return;
 
@@ -499,7 +544,8 @@ export default function App() {
       hipsPos: [...(f.hipsPos || [0, 0, 0])],
       rawHipsPos: [...(f.rawHipsPos || f.hipsPos || [0, 0, 0])],
       localQuats: { ...(f.localQuats || {}) },
-      rawLocalQuats: { ...(f.rawLocalQuats || f.localQuats || {}) }
+      rawLocalQuats: { ...(f.rawLocalQuats || f.localQuats || {}) },
+      expressions: { ...(f.expressions || { blink: 0, mouthOpen: 0, smile: 0, relaxed: 0 }) }
     }));
 
     const blendFactor = THREE.MathUtils.clamp(config.smoothing || 0.35, 0.15, 0.75);
@@ -510,7 +556,8 @@ export default function App() {
         hipsPos: [...f.hipsPos],
         rawHipsPos: [...f.rawHipsPos],
         localQuats: { ...f.localQuats },
-        rawLocalQuats: { ...f.rawLocalQuats }
+        rawLocalQuats: { ...f.rawLocalQuats },
+        expressions: { ...f.expressions }
       }));
 
       for (let i = 1; i < current.length - 1; i++) {
@@ -640,7 +687,8 @@ export default function App() {
                   rawHipsPos: solved.hipsPos,
                   rawLocalQuats: solved.localQuats,
                   hipsPos: combinedPose ? combinedPose.hipsPos : solved.hipsPos,
-                  localQuats: combinedPose ? combinedPose.localQuats : solved.localQuats
+                  localQuats: combinedPose ? combinedPose.localQuats : solved.localQuats,
+                  expressions: solved.expressions
                 }
               ]);
             }
@@ -778,15 +826,12 @@ export default function App() {
 
   const currentSelOffset = selectedBone ? (boneOffsets[selectedBone] || { rx: 0, ry: 0, rz: 0 }) : null;
 
-
   const formatTime = (seconds) => {
     if (!Number.isFinite(seconds) || seconds <= 0) return '00:00';
     const mins = Math.floor(seconds / 60);
     const secs = Math.floor(seconds % 60);
     return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
   };
-
-
 
   return (
     <div className="mp-container">
@@ -945,15 +990,12 @@ export default function App() {
             </div>
           </div>
 
-
-        
           <div style={{ display: 'flex', justifyContent: 'space-between', fontSize: '12px', color: '#94a3b8', margin: '8px 0 4px' }}>
             <span>{statusText}</span>
             <span style={{ color: '#fbbf24' }}>🎭 {vrmName}</span>
-           <span style={{ color: '#38bdf8', fontFamily: 'monospace', fontWeight: 700 }}>
+            <span style={{ color: '#38bdf8', fontFamily: 'monospace', fontWeight: 700 }}>
               ⏱️ {formatTime(videoCurrentTime)} / {formatTime(videoDuration)}
             </span>
-
           </div>
 
           <div className="mp-btn-row">
@@ -989,37 +1031,185 @@ export default function App() {
             ))}
           </div>
 
-       {/* Checkbox / Botón rápido para Desbloquear o Bloquear el Límite de Rotación en vivo */}
-       <div
-         onClick={() => setConfig((prev) => ({ ...prev, unlockRotation: !prev.unlockRotation }))}
-         style={{
-           marginTop: '8px',
-           padding: '10px 12px',
-           borderRadius: '10px',
-           cursor: 'pointer',
-           display: 'flex',
-           alignItems: 'center',
-           justifyContent: 'space-between',
-           background: config.unlockRotation ? '#3b0764' : '#1e293b',
-           border: config.unlockRotation ? '1px solid #c084fc' : '1px solid #334155',
-           transition: 'all 0.15s ease'
-         }}
-       >
-         <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', fontWeight: 700, color: config.unlockRotation ? '#e9d5ff' : '#cbd5e1', cursor: 'pointer', pointerEvents: 'none' }}>
-           <input
-             type="checkbox"
-             checked={Boolean(config.unlockRotation)}
-             readOnly
-             style={{ width: '16px', height: '16px', accentColor: '#a855f7' }}
-           />
-           {config.unlockRotation
-             ? '🔓 Giro 360° DESBLOQUEADO (Toca para bloquear)'
-             : '🔒 Límite de Rotación Bloqueado (Toca para giro 360°)'}
-         </label>
-         <span style={{ fontSize: '11px', padding: '3px 8px', borderRadius: '6px', background: config.unlockRotation ? '#9333ea' : '#334155', color: '#fff', fontWeight: 600 }}>
-           {config.unlockRotation ? '360° LIBRE' : 'FRENTE FIJO'}
-         </span>
-       </div>
+          {/* Checkbox / Botón rápido para Desbloquear o Bloquear el Límite de Rotación en vivo */}
+          <div
+            onClick={() => setConfig((prev) => ({ ...prev, unlockRotation: !prev.unlockRotation }))}
+            style={{
+              marginTop: '8px',
+              padding: '10px 12px',
+              borderRadius: '10px',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              background: config.unlockRotation ? '#3b0764' : '#1e293b',
+              border: config.unlockRotation ? '1px solid #c084fc' : '1px solid #334155',
+              transition: 'all 0.15s ease'
+            }}
+          >
+            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', fontWeight: 700, color: config.unlockRotation ? '#e9d5ff' : '#cbd5e1', cursor: 'pointer', pointerEvents: 'none' }}>
+              <input
+                type="checkbox"
+                checked={Boolean(config.unlockRotation)}
+                readOnly
+                style={{ width: '16px', height: '16px', accentColor: '#a855f7' }}
+              />
+              {config.unlockRotation
+                ? '🔓 Giro 360° DESBLOQUEADO (Toca para bloquear)'
+                : '🔒 Límite de Rotación Bloqueado (Toca para giro 360°)'}
+            </label>
+            <span style={{ fontSize: '11px', padding: '3px 8px', borderRadius: '6px', background: config.unlockRotation ? '#9333ea' : '#334155', color: '#fff', fontWeight: 600 }}>
+              {config.unlockRotation ? '360° LIBRE' : 'FRENTE FIJO'}
+            </span>
+          </div>
+
+          {/* Control de Gestos de Cara (Opción 1: Ligero + Parpadeo + Boca Reactiva) */}
+          <div style={{ marginTop: '8px', padding: '10px 12px', background: '#141724', borderRadius: '10px', border: '1px solid #2e344d' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', fontWeight: 700, color: '#f472b6', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={Boolean(config.faceTrackingEnabled)}
+                  onChange={(e) => {
+                    const enabled = e.target.checked;
+                    setConfig((prev) => ({ ...prev, faceTrackingEnabled: enabled }));
+                    if (!enabled) {
+                      const currentAvatar = vrmListRef.current?.[activeVrmIndexRef.current];
+                      if (currentAvatar?.vrm) {
+                        applyFacialExpressions(currentAvatar.vrm, { blink: 0, mouthOpen: 0, smile: 0, relaxed: 0 });
+                      }
+                    }
+                  }}
+                  style={{ width: '16px', height: '16px', accentColor: '#ec4899' }}
+                />
+                😊 Gestos de Cara y Parpadeo (Opción 1 Ligera)
+              </label>
+              <span style={{ fontSize: '11px', color: '#94a3b8' }}>
+                {config.faceTrackingEnabled ? 'ACTIVO' : 'APAGADO'}
+              </span>
+            </div>
+
+            {config.faceTrackingEnabled && (
+              <div className="mp-btn-row" style={{ marginTop: '8px' }}>
+                {[
+                  { id: 'auto', label: '✨ Auto (Video)' },
+                  { id: 'happy', label: '😄 Feliz' },
+                  { id: 'sing', label: '🎤 Canto/Boca' },
+                  { id: 'relaxed', label: '😌 Relajada' }
+                ].map((mode) => (
+                  <button
+                    key={mode.id}
+                    className="mp-btn"
+                    style={{
+                      padding: '6px 8px',
+                      fontSize: '11px',
+                      background: config.faceExpressionPreset === mode.id ? '#db2777' : '#1e293b',
+                      border: config.faceExpressionPreset === mode.id ? '1px solid #f9a8d4' : '1px solid #334155'
+                    }}
+                    onClick={() => setConfig((prev) => ({ ...prev, faceExpressionPreset: mode.id }))}
+                  >
+                    {mode.label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Control de Dedos de las Manos (Opcional + Poses Rápidas) */}
+          <div style={{ marginTop: '8px', padding: '10px 12px', background: '#141724', borderRadius: '10px', border: '1px solid #2e344d' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', fontWeight: 700, color: '#34d399', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={Boolean(config.fingerTrackingEnabled)}
+                  onChange={(e) => {
+                    const enabled = e.target.checked;
+                    setConfig((prev) => ({ ...prev, fingerTrackingEnabled: enabled }));
+                    if (!enabled) {
+                      const currentAvatar = vrmListRef.current?.[activeVrmIndexRef.current];
+                      const humanoid = currentAvatar?.vrm?.humanoid;
+                      if (humanoid) {
+                        FINGER_BONE_LIST.forEach((b) => {
+                          const node = humanoid.getNormalizedBoneNode(b);
+                          if (node) node.quaternion.set(0, 0, 0, 1);
+                        });
+                      }
+                    }
+                  }}
+                  style={{ width: '16px', height: '16px', accentColor: '#10b981' }}
+                />
+                🖐️ Seguir Dedos de las Manos (Opcional)
+              </label>
+              <span style={{ fontSize: '11px', color: '#94a3b8' }}>
+                {config.fingerTrackingEnabled ? 'ACTIVO' : 'APAGADO'}
+              </span>
+            </div>
+
+            {config.fingerTrackingEnabled && (
+              <>
+                <div className="mp-btn-row" style={{ marginTop: '8px' }}>
+                  {[
+                    { id: 'auto', label: '✨ Auto (Video)' },
+                    { id: 'open', label: '🖐️ Abierta' },
+                    { id: 'fist', label: '✊ Puño' },
+                    { id: 'peace', label: '✌️ Paz' },
+                    { id: 'rock', label: '🤘 Rock' }
+                  ].map((mode) => (
+                    <button
+                      key={mode.id}
+                      className="mp-btn"
+                      style={{
+                        padding: '6px 8px',
+                        fontSize: '11px',
+                        background: config.fingerPreset === mode.id ? '#059669' : '#1e293b',
+                        border: config.fingerPreset === mode.id ? '1px solid #6ee7b7' : '1px solid #334155'
+                      }}
+                      onClick={() => setConfig((prev) => ({ ...prev, fingerPreset: mode.id }))}
+                    >
+                      {mode.label}
+                    </button>
+                  ))}
+                </div>
+
+                {config.fingerPreset === 'auto' && (
+                  <div style={{ marginTop: '8px', display: 'flex', alignItems: 'center', gap: '8px', fontSize: '11px', color: '#cbd5e1' }}>
+                    <span>Sensibilidad Cierre: {Math.round((config.fingerCurlSensitivity ?? 1.0) * 100)}%</span>
+                    <input
+                      type="range"
+                      min="0.4"
+                      max="1.8"
+                      step="0.1"
+                      value={config.fingerCurlSensitivity ?? 1.0}
+                      onChange={(e) => setConfig((prev) => ({ ...prev, fingerCurlSensitivity: parseFloat(e.target.value) }))}
+                      style={{ flex: 1, accentColor: '#10b981', cursor: 'pointer' }}
+                    />
+                  </div>
+                )}
+              </>
+            )}
+          </div>
+
+          {/* Control Manual para Pierna Alta / Patadas (Checkbox) */}
+          <div style={{ marginTop: '8px', padding: '10px 12px', background: '#141724', borderRadius: '10px', border: '1px solid #2e344d' }}>
+            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+              <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', fontWeight: 700, color: '#facc15', cursor: 'pointer' }}>
+                <input
+                  type="checkbox"
+                  checked={Boolean(config.highLegBoost)}
+                  onChange={(e) => setConfig((prev) => ({ ...prev, highLegBoost: e.target.checked }))}
+                  style={{ width: '16px', height: '16px', accentColor: '#eab308' }}
+                />
+                 extremidad al limite / Apoyo Elevado (Manual)
+              </label>
+              <span style={{ fontSize: '11px', color: '#94a3b8' }}>
+                {config.highLegBoost ? 'ACTIVADO' : 'APAGADO'}
+              </span>
+            </div>
+            <div style={{ fontSize: '11px', color: '#94a3b8', marginTop: '4px', marginLeft: '24px' }}>
+              Actívalo cuando el personaje suba la rodilla al pecho o apoye el pie en alto.
+            </div>
+          </div>
+
 
           
 
@@ -1131,6 +1321,25 @@ export default function App() {
                 🧹 Limpiar Todos los Cambios
               </button>
             </div>
+          </div>
+        </div>
+
+        <div style={{ marginTop: '8px', padding: '10px 12px', background: '#141724', borderRadius: '10px', border: '1px solid #2e344d' }}>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', fontWeight: 700, color: '#60a5fa', cursor: 'pointer' }}>
+            <input type="checkbox" checked={config.moveEnabled !== false}
+              onChange={(e) => setConfig((p) => ({ ...p, moveEnabled: e.target.checked }))} />
+            ↔️ Permitir desplazamiento izquierda/derecha
+          </label>
+          <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', fontWeight: 700, color: '#60a5fa', cursor: 'pointer', marginTop: '6px' }}>
+            <input type="checkbox" checked={Boolean(config.moveDepthEnabled)}
+              onChange={(e) => setConfig((p) => ({ ...p, moveDepthEnabled: e.target.checked }))} />
+            ↕️ Permitir adelante/atrás (experimental)
+          </label>
+          <div style={{ marginTop: '8px', fontSize: '11px', color: '#cbd5e1' }}>
+            🦾 Estabilidad de brazos: {Math.round((config.armStability ?? 0.6) * 100)}%
+            <input type="range" min="0" max="1" step="0.05" value={config.armStability ?? 0.6}
+              onChange={(e) => setConfig((p) => ({ ...p, armStability: parseFloat(e.target.value) }))}
+              style={{ width: '100%', accentColor: '#60a5fa' }} />
           </div>
         </div>
 

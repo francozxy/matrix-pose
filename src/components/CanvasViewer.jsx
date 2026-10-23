@@ -18,6 +18,7 @@ export default function CanvasViewer({
 }) {
   const mountRef = useRef(null);
   const sceneRef = useRef(null);
+  const cameraRef = useRef(null);
   const controlsRef = useRef(null);
   const transformControlsRef = useRef(null);
   const boneMarkerGroupRef = useRef(new THREE.Group());
@@ -66,6 +67,36 @@ export default function CanvasViewer({
     'rightUpperLeg', 'rightLowerLeg', 'rightFoot'
   ];
 
+  // Función para enfocar la cámara directamente a la cara o volver al cuerpo entero
+  const setCameraView = (viewMode) => {
+    const cam = cameraRef.current;
+    const ctrl = controlsRef.current;
+    if (!cam || !ctrl) return;
+
+    const currentAvatar = propsRef.current.vrmList?.[propsRef.current.activeVrmIndex];
+    const activeVrm = currentAvatar?.vrm;
+
+    if (viewMode === 'face') {
+      const headPos = new THREE.Vector3(0, 1.38, 0);
+      if (activeVrm?.humanoid) {
+        const headNode =
+          activeVrm.humanoid.getRawBoneNode?.('head') ||
+          activeVrm.humanoid.getNormalizedBoneNode('head');
+        if (headNode) {
+          headNode.getWorldPosition(headPos);
+          headPos.y += 0.05; // Subir al centro de los ojos/cara
+        }
+      }
+      ctrl.target.copy(headPos);
+      cam.position.set(headPos.x, headPos.y + 0.02, headPos.z + 0.52);
+      ctrl.update();
+    } else {
+      ctrl.target.set(0, 0.95, 0);
+      cam.position.set(0, 1.05, 2.35);
+      ctrl.update();
+    }
+  };
+
   // 1. Inicializar Escena WebGL una sola vez
   useEffect(() => {
     const container = mountRef.current;
@@ -78,8 +109,12 @@ export default function CanvasViewer({
     const width = container.clientWidth || 300;
     const height = container.clientHeight || 270;
 
-    const camera = new THREE.PerspectiveCamera(40, width / height, 0.05, 100);
-    camera.position.set(0, 1.0, 2.35);
+    // near = 0.005 (5mm) para que la cámara JAMÁS corte ni desaparezca la cara al acercarse
+    const camera = new THREE.PerspectiveCamera(38, width / height, 0.005, 100);
+    camera.position.set(0, 1.05, 2.35);
+    // Habilitar todas las capas para que firstPerson del VRM no oculte la cabeza
+    camera.layers.enableAll();
+    cameraRef.current = camera;
 
     const renderer = new THREE.WebGLRenderer({ antialias: true });
     renderer.setSize(width, height);
@@ -88,7 +123,11 @@ export default function CanvasViewer({
     container.appendChild(renderer.domElement);
 
     const controls = new OrbitControls(camera, renderer.domElement);
-    controls.target.set(0, 0.92, 0);
+    controls.target.set(0, 0.95, 0);
+    controls.enablePan = true;
+    controls.screenSpacePanning = true;
+    controls.minDistance = 0.15;
+    controls.maxDistance = 6.0;
     controls.update();
     controlsRef.current = controls;
 
@@ -96,8 +135,7 @@ export default function CanvasViewer({
     scene.add(pivot);
 
     const tc = new TransformControls(camera, renderer.domElement);
-    // Tamaño grande y constante para que no se achique al acercar la cámara
-    tc.size = 1.35;
+    tc.size = 1.25;
     tc.setSpace('local');
     transformControlsRef.current = tc;
 
@@ -119,7 +157,6 @@ export default function CanvasViewer({
       if (!normNode) return;
 
       if (event.value) {
-        // Capturar pose exacta al iniciar el giro para evitar saltos
         dragStartRef.current.startBoneLocalQuat.copy(normNode.quaternion);
         dragStartRef.current.startPivotQuatInv.copy(pivot.quaternion).invert();
 
@@ -135,7 +172,6 @@ export default function CanvasViewer({
         const baseMPQuat = normNode.quaternion.clone().multiply(prevOffQuat.invert());
         dragStartRef.current.baseMediaPipeQuatInv.copy(baseMPQuat).invert();
       } else {
-        // Guardar offset final al soltar
         const finalOffsetQuat = dragStartRef.current.baseMediaPipeQuatInv
           .clone()
           .multiply(normNode.quaternion);
@@ -154,7 +190,6 @@ export default function CanvasViewer({
       }
     });
 
-    // Rotar en vivo mientras se mueve el dedo
     tc.addEventListener('objectChange', () => {
       if (!isDraggingRef.current) return;
       const { vrmList: list, activeVrmIndex: idx, selectedBone: sBone, boneOffsets: offsets, onBoneOffsetChange: cb } = propsRef.current;
@@ -212,7 +247,7 @@ export default function CanvasViewer({
     const light = new THREE.DirectionalLight(0xffffff, 1.8);
     light.position.set(1, 3, 3);
     scene.add(light);
-    scene.add(new THREE.AmbientLight(0xffffff, 0.85));
+    scene.add(new THREE.AmbientLight(0xffffff, 0.95));
 
     const raycaster = new THREE.Raycaster();
     const mouse = new THREE.Vector2();
@@ -244,7 +279,6 @@ export default function CanvasViewer({
     renderer.domElement.addEventListener('pointerdown', handlePointerDown);
     renderer.domElement.addEventListener('pointerup', handlePointerUp);
 
-    // Usamos performance.now() en lugar de THREE.Clock para eliminar el warning de deprecación
     let lastFrameTime = performance.now();
     let reqId;
     const worldPos = new THREE.Vector3();
@@ -300,6 +334,24 @@ export default function CanvasViewer({
               }
             }
           });
+
+          // Si seleccionas un hueso de dedo desde el panel (que no tiene esfera verde para no tapar la mano),
+          // igual colocamos el Gizmo sobre ese dedo:
+          if (sBone && !boneList.includes(sBone)) {
+            const normNode = activeVrm.humanoid.getNormalizedBoneNode(sBone);
+            const rawNode = activeVrm.humanoid.getRawBoneNode
+              ? activeVrm.humanoid.getRawBoneNode(sBone)
+              : normNode;
+            if (rawNode && normNode) {
+              rawNode.getWorldPosition(worldPos);
+              pivot.position.copy(worldPos);
+              if (!isDraggingRef.current) {
+                normNode.getWorldQuaternion(worldQuat);
+                pivot.quaternion.copy(worldQuat);
+                pivot.scale.set(1, 1, 1);
+              }
+            }
+          }
         }
       }
 
@@ -329,7 +381,7 @@ export default function CanvasViewer({
     };
   }, []);
 
-  // 2. Insertar el modelo VRM en la escena cuando se sube
+  // 2. Insertar el modelo VRM en la escena y evitar que la cabeza o cara desaparezcan al hacer zoom
   useEffect(() => {
     const scene = sceneRef.current;
     if (!scene) return;
@@ -346,6 +398,16 @@ export default function CanvasViewer({
         const vrmScene = vData.vrm.scene;
         vrmScene.userData.isVRMScene = true;
         vrmScene.visible = true;
+
+        // FORZAR VISIBILIDAD TOTAL DE CARA Y CABEZA AL HACER ZOOM:
+        // Desactiva el Frustum Culling y habilita todas las capas (evita que firstPerson oculte la cara)
+        vrmScene.traverse((obj) => {
+          obj.frustumCulled = false;
+          obj.layers.enableAll();
+          if (obj.isMesh || obj.isSkinnedMesh) {
+            obj.visible = true;
+          }
+        });
 
         if (!scene.children.includes(vrmScene)) {
           scene.add(vrmScene);
@@ -374,9 +436,56 @@ export default function CanvasViewer({
   }, [selectedBone, gizmoEnabled, gizmoMode, activeVrmIndex, vrmList.length]);
 
   return (
-    <div
-      ref={mountRef}
-      style={{ width: '100%', height: '100%', position: 'relative', overflow: 'hidden', touchAction: 'none' }}
-    />
+    <div style={{ width: '100%', height: '100%', position: 'relative', overflow: 'hidden' }}>
+      <div
+        ref={mountRef}
+        style={{ width: '100%', height: '100%', position: 'relative', overflow: 'hidden', touchAction: 'none' }}
+      />
+
+      {/* Botones rápidos flotantes para enfocar la cara o volver al cuerpo completo */}
+      <div
+        style={{
+          position: 'absolute',
+          top: '8px',
+          right: '8px',
+          display: 'flex',
+          gap: '6px',
+          zIndex: 10
+        }}
+      >
+        <button
+          type="button"
+          onClick={() => setCameraView('face')}
+          style={{
+            background: 'rgba(15, 23, 42, 0.85)',
+            color: '#f472b6',
+            border: '1px solid #f472b6',
+            borderRadius: '6px',
+            padding: '4px 8px',
+            fontSize: '5px',
+            fontWeight: 700,
+            cursor: 'pointer'
+          }}
+        >
+          😊 Ver Cara
+        </button>
+        <button
+          type="button"
+          onClick={() => setCameraView('body')}
+          style={{
+            background: 'rgba(15, 23, 42, 0.85)',
+            color: '#38bdf8',
+            border: '1px solid #38bdf8',
+            borderRadius: '6px',
+            padding: '4px 8px',
+            fontSize: '5px',
+            fontWeight: 700,
+            cursor: 'pointer'
+          }}
+        >
+          🧍 Cuerpo
+        </button>
+      </div>
+    </div>
   );
 }
