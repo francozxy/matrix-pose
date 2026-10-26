@@ -116,7 +116,9 @@ function applyQuatDeadzone(currQ, prevQArray, threshold = 0.008) {
   if (!prevQArray) return currQ;
   const prevQ = sanitizeQuat(new THREE.Quaternion(...prevQArray));
   const dot = Math.abs(currQ.dot(prevQ));
-  if (dot > 1.0 - threshold * 0.1) {
+ const angle = 2 * Math.acos(dot); // Ángulo real de cambio entre frames
+  // Si se movió menos de ~2 grados (0.035 rad), se queda 100% quieto
+  if (angle < minAngleRad) {
     return prevQ;
   }
   return currQ;
@@ -351,6 +353,7 @@ function solveHead(
   pNose, pLEye, pREye, pLEar, pREar, fv,
   chestQuat, reliableTorsoYaw, config, prevHeadWorldArray, prevHeadYaw
 ) {
+//const maxLocalYaw = lookAtCamera ? 1.05 : 0.45;
   const headGain = (config.headSensitivity ?? 1.0) * 0.55;
   const lookAtCamera = config?.headLookAtCamera !== false;
 
@@ -987,6 +990,8 @@ export function solvePoseToVRM(worldLandmarks, screenLandmarks, prevFrame, confi
   }
 
   const mirrorSign = config.mirror ? -1 : 1;
+  // App marca prevFrame.cut = true cuando detecta un cambio de plano: no se mezcla con el frame anterior
+  const cutReset = Boolean(prevFrame?.cut);
 
   const L = config.mirror
     ? { sh: 11, el: 13, wr: 15, pinky: 17, index: 19, thumb: 21, hip: 23, kn: 25, an: 27, eye: 2, ear: 7 }
@@ -1030,11 +1035,11 @@ export function solvePoseToVRM(worldLandmarks, screenLandmarks, prevFrame, confi
     prevFrame?.torsoYaw ?? 0
   );
 
-  const prevYaw = prevFrame?.torsoYaw ?? rawTorsoYaw;
+  const prevYaw = cutReset ? rawTorsoYaw : (prevFrame?.torsoYaw ?? rawTorsoYaw);
   const unwrappedYaw = unwrapAngle(rawTorsoYaw, prevYaw);
   const reliableTorsoYaw = prevYaw + (unwrappedYaw - prevYaw) * 0.35;
 
-  const hipsData = solveHips(pLHip, pRHip, reliableTorsoYaw, screenLandmarks, mirrorSign, prevFrame, config);
+  const hipsData = solveHips(pLHip, pRHip, reliableTorsoYaw, screenLandmarks, mirrorSign, cutReset ? null : prevFrame, config);
   const torsoData = solveSpineAndChest(shCenter, hipCenter, pRSh, pLSh, reliableTorsoYaw, hipsData.quat, hipsData.hipYaw);
   const headData = solveHead(
     pNose,
@@ -1052,8 +1057,8 @@ export function solvePoseToVRM(worldLandmarks, screenLandmarks, prevFrame, confi
     torsoData.chest,
     reliableTorsoYaw,
     config,
-    prevFrame?.worldQuats?.head,
-    prevFrame?.headYaw
+    cutReset ? undefined : prevFrame?.worldQuats?.head,
+    cutReset ? undefined : prevFrame?.headYaw
   );
   const { meta: armMeta, ...armsData } = solveArms(
     pLSh, pRSh, pLEl, pREl, pLWr, pRWr,
@@ -1064,7 +1069,7 @@ export function solvePoseToVRM(worldLandmarks, screenLandmarks, prevFrame, confi
     { el: vis(R.el), wr: vis(R.wr) },
     config,
     prevFrame?.worldQuats,
-    prevFrame?.armMeta
+    cutReset ? undefined : prevFrame?.armMeta
   );
 
   const fingersLocalData = solveFingers(
@@ -1080,7 +1085,7 @@ export function solvePoseToVRM(worldLandmarks, screenLandmarks, prevFrame, confi
     rightLowerLeg: sanitizeQuat(new THREE.Quaternion(...prevFrame.worldQuats.rightLowerLeg))
   } : null;
 
-  const legsData = solveLegs(
+  let legsData = solveLegs(
     pLHip,
     pRHip,
     pLKn,
@@ -1092,6 +1097,26 @@ export function solvePoseToVRM(worldLandmarks, screenLandmarks, prevFrame, confi
     config,
     prevLegQuats
   );
+
+  // Plano cerrado (cara/torso): cadera y rodillas casi invisibles -> MediaPipe inventa las piernas.
+  // Con la opción de cambio de plano activa, se conserva la pose previa de las piernas y la posición de cadera.
+  const lowBodyVis = (vis(23) + vis(24) + vis(25) + vis(26)) / 4;
+  const lowBodyHidden = Boolean(config.shotCutDetection) && lowBodyVis < 0.35;
+  if (lowBodyHidden && prevLegQuats) {
+    legsData = {
+      ...legsData,
+      leftUpperLeg: prevLegQuats.leftUpperLeg,
+      leftLowerLeg: prevLegQuats.leftLowerLeg,
+      rightUpperLeg: prevLegQuats.rightUpperLeg,
+      rightLowerLeg: prevLegQuats.rightLowerLeg
+    };
+  }
+  if (lowBodyHidden && prevFrame) {
+    hipsData.pos = [...(prevFrame.hipsPos || [0, 0, 0])];
+    hipsData.baseHipY = prevFrame.baseHipY ?? hipsData.baseHipY;
+    hipsData.baseFootY = prevFrame.baseFootY ?? hipsData.baseFootY;
+    hipsData.originX = prevFrame.originX ?? hipsData.originX;
+  }
 
   const worldQuats = {
     hips: hipsData.quat,
@@ -1138,7 +1163,7 @@ export function solvePoseToVRM(worldLandmarks, screenLandmarks, prevFrame, confi
       localQuats[bone].z = -localQuats[bone].z;
     }
 
-    if (prevFrame && prevFrame.localQuats && prevFrame.localQuats[bone]) {
+    if (!cutReset && prevFrame && prevFrame.localQuats && prevFrame.localQuats[bone]) {
       // Brazos: filtro adaptativo. Movimiento pequeño (ruido/temblor) -> casi se queda quieto;
       // movimiento grande (baile real) -> sigue rápido. Controlado por config.armStability (0..1).
       const armStab = THREE.MathUtils.clamp(config.armStability ?? 0.6, 0, 1);
@@ -1164,7 +1189,7 @@ export function solvePoseToVRM(worldLandmarks, screenLandmarks, prevFrame, confi
   }
 
   const finalHipsPos = [...hipsData.pos];
-  if (prevFrame && prevFrame.hipsPos) {
+  if (!cutReset && prevFrame && prevFrame.hipsPos) {
     for (let i = 0; i < 3; i++) {
       finalHipsPos[i] = prevFrame.hipsPos[i] * config.smoothing + finalHipsPos[i] * (1 - config.smoothing);
     }

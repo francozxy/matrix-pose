@@ -111,6 +111,12 @@ export default function App() {
   const [gizmoMode, setGizmoMode] = useState('rotate');
   const [poseVersion, setPoseVersion] = useState(0);
 
+  const pendingCutRef = useRef(false);
+  const lastThumbRef = useRef(null);
+  const cutCanvasRef = useRef(null);
+  const lastCutTimeRef = useRef(-10);
+  const [cutCount, setCutCount] = useState(0);
+
   const [config, setConfig] = useState({
     mirror: true,
     vrm0Mode: false,
@@ -132,7 +138,9 @@ export default function App() {
     headLookAtCamera: true,
     moveEnabled: true,
     moveDepthEnabled: false,
-    armStability: 0.6
+    armStability: 0.6,
+    shotCutDetection: false,
+    shotCutSensitivity: 0.5
   });
 
   const [videoCurrentTime, setVideoCurrentTime] = useState(0);
@@ -565,6 +573,8 @@ export default function App() {
         const currF = current[i];
         const nextF = current[i + 1];
 
+        if (currF.cut || nextF.cut) continue;
+
         for (let axis = 0; axis < 3; axis++) {
           const avgPos = (prevF.rawHipsPos[axis] + nextF.rawHipsPos[axis]) * 0.5;
           next[i].rawHipsPos[axis] = currF.rawHipsPos[axis] * (1 - blendFactor) + avgPos * blendFactor;
@@ -667,6 +677,16 @@ export default function App() {
                 ? vid.videoWidth / vid.videoHeight
                 : 0.6;
 
+                   let cutThisFrame = false;
+                 if (pendingCutRef.current) {
+                   pendingCutRef.current = false;
+                    cutThisFrame = true;
+                   if (prevPoseRef.current) prevPoseRef.current = { ...prevPoseRef.current, cut: true };
+                     }
+
+
+
+
             const solved = solvePoseToVRM(
               results.poseWorldLandmarks,
               results.poseLandmarks,
@@ -684,6 +704,7 @@ export default function App() {
                 ...prev,
                 {
                   time: videoTimeMs,
+                  cut: cutThisFrame,
                   rawHipsPos: solved.hipsPos,
                   rawLocalQuats: solved.localQuats,
                   hipsPos: combinedPose ? combinedPose.hipsPos : solved.hipsPos,
@@ -747,6 +768,18 @@ export default function App() {
         if (!isProcessingRef.current) {
           isProcessingRef.current = true;
           lastProcessTimeRef.current = now;
+
+
+
+          if (configRef.current.shotCutDetection && detectShotCut(vid)) {
+            pendingCutRef.current = true;
+            try { poseInstanceRef.current.reset?.(); } catch (e) {}
+            setCutCount((c) => c + 1);
+            if (isRecRef.current) {
+              setExportLogs((prev) => [...prev, `✂️ Corte detectado en ${vid.currentTime.toFixed(2)}s`]);
+            }
+          }
+          
           try {
             await poseInstanceRef.current.send({ image: vid });
           } catch (e) {
@@ -768,7 +801,17 @@ export default function App() {
     setIsPlayingPreview(false);
 
     if (!isRecording) {
+//lo q yo agrege ...
+      lastThumbRef.current = null;
+      pendingCutRef.current = false;
+       lastCutTimeRef.current = -10;
+    setCutCount(0);
+
+    
       if (!keepOffsetsOnRecord) {
+
+
+      
         boneOffsetsRef.current = {};
         setBoneOffsets({});
         const currentAvatar = vrmListRef.current?.[activeVrmIndexRef.current];
@@ -832,6 +875,51 @@ export default function App() {
     const secs = Math.floor(seconds % 60);
     return `${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
   };
+
+
+
+
+
+const detectShotCut = (vid) => {
+  if (!cutCanvasRef.current) {
+    const c = document.createElement('canvas');
+    c.width = 32; c.height = 18;
+    cutCanvasRef.current = c;
+  }
+  const ctx = cutCanvasRef.current.getContext('2d', { willReadFrequently: true });
+  ctx.drawImage(vid, 0, 0, 32, 18);
+  const d = ctx.getImageData(0, 0, 32, 18).data;
+  const n = 32 * 18;
+  const luma = new Float32Array(n);
+  const hist = new Float32Array(16);
+  for (let i = 0; i < n; i++) {
+    const l = (0.299 * d[i * 4] + 0.587 * d[i * 4 + 1] + 0.114 * d[i * 4 + 2]) / 255;
+    luma[i] = l;
+    hist[Math.min(15, (l * 16) | 0)] += 1 / n;
+  }
+  const prev = lastThumbRef.current;
+  lastThumbRef.current = { luma, hist };
+  if (!prev) return false;
+
+  let mad = 0;
+  for (let i = 0; i < n; i++) mad += Math.abs(luma[i] - prev.luma[i]);
+  mad /= n;
+  let hd = 0;
+  for (let i = 0; i < 16; i++) hd += Math.abs(hist[i] - prev.hist[i]) * 0.5;
+
+  const sens = configRef.current.shotCutSensitivity ?? 0.5;
+  const th = 0.38 - 0.28 * sens;
+  const t = vid.currentTime;
+  if (t < lastCutTimeRef.current) lastCutTimeRef.current = -10;
+  if (t - lastCutTimeRef.current < 0.25) return false;
+
+  const isCut = mad > th || (mad > th * 0.7 && hd > 0.25);
+  if (isCut) lastCutTimeRef.current = t;
+  return isCut;
+};
+
+
+  
 
   return (
     <div className="mp-container">
@@ -1114,6 +1202,42 @@ export default function App() {
               </div>
             )}
           </div>
+
+
+          {/* Checkbox Opcional: Cabeza mira al espectador / cámara */}
+          <div
+            onClick={() => setConfig((prev) => ({ ...prev, headLookAtCamera: !prev.headLookAtCamera }))}
+            style={{
+              marginTop: '8px',
+              padding: '10px 12px',
+              borderRadius: '10px',
+              cursor: 'pointer',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'space-between',
+              background: config.headLookAtCamera ? '#0f2942' : '#1e293b',
+              border: config.headLookAtCamera ? '1px solid #38bdf8' : '1px solid #334155',
+              transition: 'all 0.15s ease'
+            }}
+          >
+            <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', fontWeight: 700, color: config.headLookAtCamera ? '#bae6fd' : '#cbd5e1', cursor: 'pointer', pointerEvents: 'none' }}>
+              <input
+                type="checkbox"
+                checked={Boolean(config.headLookAtCamera)}
+                readOnly
+                style={{ width: '16px', height: '16px', accentColor: '#38bdf8' }}
+              />
+              👀 Mirar al Espectador / Cámara (Cabeza sigue orientación real)
+            </label>
+            <span style={{ fontSize: '11px', padding: '3px 8px', borderRadius: '6px', background: config.headLookAtCamera ? '#0284c7' : '#334155', color: '#fff', fontWeight: 600 }}>
+              {config.headLookAtCamera ? 'ACTIVO' : 'APAGADO'}
+            </span>
+          </div>
+
+
+
+
+          
 
           {/* Control de Dedos de las Manos (Opcional + Poses Rápidas) */}
           <div style={{ marginTop: '8px', padding: '10px 12px', background: '#141724', borderRadius: '10px', border: '1px solid #2e344d' }}>
@@ -1420,6 +1544,26 @@ export default function App() {
               )}
             </div>
           </div>
+
+<div style={{ marginTop: '8px', padding: '10px 12px', background: '#141724', borderRadius: '10px', border: '1px solid #2e344d' }}>
+  <label style={{ display: 'flex', alignItems: 'center', gap: '8px', fontSize: '13px', fontWeight: 700, color: '#fb923c', cursor: 'pointer' }}>
+    <input type="checkbox" checked={Boolean(config.shotCutDetection)}
+      onChange={(e) => setConfig((p) => ({ ...p, shotCutDetection: e.target.checked }))} />
+    ✂️ Detectar cambios de plano ({cutCount})
+  </label>
+  {config.shotCutDetection && (
+    <div style={{ marginTop: '8px', fontSize: '11px', color: '#cbd5e1' }}>
+      Sensibilidad: {Math.round((config.shotCutSensitivity ?? 0.5) * 100)}%
+      <input type="range" min="0" max="1" step="0.05" value={config.shotCutSensitivity ?? 0.5}
+        onChange={(e) => setConfig((p) => ({ ...p, shotCutSensitivity: parseFloat(e.target.value) }))}
+        style={{ width: '100%', accentColor: '#fb923c' }} />
+    </div>
+  )}
+</div>
+
+
+
+
 
           <PosingPanel
             vrmList={vrmList}
