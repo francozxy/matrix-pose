@@ -112,11 +112,11 @@ function applyDeadzone(currentVal, prevVal, threshold = 0.0035) {
   return Math.abs(currentVal - prevVal) < threshold ? prevVal : currentVal;
 }
 
-function applyQuatDeadzone(currQ, prevQArray, threshold = 0.008) {
+function applyQuatDeadzone(currQ, prevQArray, minAngleRad = 0.035) {
   if (!prevQArray) return currQ;
   const prevQ = sanitizeQuat(new THREE.Quaternion(...prevQArray));
-  const dot = Math.abs(currQ.dot(prevQ));
- const angle = 2 * Math.acos(dot); // Ángulo real de cambio entre frames
+  const dot = Math.min(1, Math.abs(currQ.dot(prevQ)));
+  const angle = 2 * Math.acos(dot); // Ángulo real de cambio entre frames
   // Si se movió menos de ~2 grados (0.035 rad), se queda 100% quieto
   if (angle < minAngleRad) {
     return prevQ;
@@ -237,12 +237,9 @@ function solveHips(pLHip, pRHip, reliableTorsoYaw, screenLandmarks, mirrorSign, 
   const moveX = config?.moveEnabled !== false;
   const moveZ = Boolean(config?.moveDepthEnabled);
 
-  // Izquierda/derecha: solo si "Permitir desplazamiento" está activado
   const dx = moveX ? applyDeadzone(rawDx, prevFrame?.hipsPos?.[0], 0.0025) : 0;
   const dy = applyDeadzone(rawDy, prevFrame?.hipsPos?.[1], 0.003);
 
-  // Adelante/atrás: se estima por cuánto crece o se encoge el torso en pantalla
-  // respecto al primer frame (más grande = más cerca de la cámara).
   const sh1 = screenLandmarks[11], sh2 = screenLandmarks[12];
   const hp1 = screenLandmarks[23], hp2 = screenLandmarks[24];
   let rawTorso = prevFrame?.torsoLenSm ?? 0;
@@ -301,7 +298,6 @@ function solveHips(pLHip, pRHip, reliableTorsoYaw, screenLandmarks, mirrorSign, 
 // 2. MÓDULO DE DORSO Y PECHO
 function solveSpineAndChest(shCenter, hipCenter, pRSh, pLSh, reliableTorsoYaw, hipsQuat, hipYaw) {
   const spineDir = new THREE.Vector3().subVectors(shCenter, hipCenter);
-  // Evitar inversión del torso si en un frame MediaPipe pierde la altura de cadera
   const safeSpineY = Math.max(0.08, spineDir.y);
 
   const frontalWeight = Math.max(0.15, Math.abs(Math.cos(reliableTorsoYaw)));
@@ -342,18 +338,10 @@ function solveSpineAndChest(shCenter, hipCenter, pRSh, pLSh, reliableTorsoYaw, h
 }
 
 // 3. MÓDULO DE CABEZA (v2: la cabeza sigue la orientación REAL de la cara en el video)
-//
-// Idea: se estima hacia dónde mira la cara respecto a la cámara usando nariz + orejas
-// (o nariz + ojos si las orejas no se ven). Ese yaw "de cámara" es el yaw mundial
-// objetivo de la cabeza, y se usa la MISMA convención de signo que el torso
-// (reliableTorsoYaw = -yaw2D), así cuando cuerpo y cara giran juntos el giro local
-// de la cabeza queda ≈ 0, y cuando el cuerpo está de lado pero la cara mira al frente,
-// la cabeza gira lo necesario para volver a mirar al frente.
 function solveHead(
   pNose, pLEye, pREye, pLEar, pREar, fv,
   chestQuat, reliableTorsoYaw, config, prevHeadWorldArray, prevHeadYaw
 ) {
-//const maxLocalYaw = lookAtCamera ? 1.05 : 0.45;
   const headGain = (config.headSensitivity ?? 1.0) * 0.55;
   const lookAtCamera = config?.headLookAtCamera !== false;
 
@@ -362,8 +350,6 @@ function solveHead(
   const eyeCenter = new THREE.Vector3().addVectors(pLEye, pREye).multiplyScalar(0.5);
   const eyeWidth = Math.abs(eyeDx);
 
-  // --- Yaw de la cara respecto a la cámara ---
-  // nariz desplazada = R·sin(θ), media anchura de la cabeza = R·cos(θ)  ->  θ = atan2(...)
   const earsOk = Math.min(fv.lEar, fv.rEar) > 0.35;
   const earSpan = Math.abs(pREar.x - pLEar.x);
   const refX = earsOk ? (pLEar.x + pREar.x) * 0.5 : eyeCenter.x;
@@ -371,31 +357,25 @@ function solveHead(
   const noseOff = pNose.x - refX;
   const faceYawCam = THREE.MathUtils.clamp(Math.atan2(noseOff, halfW), -1.45, 1.45);
 
-  // Confianza: nariz y ojos visibles. Si el personaje está de espaldas o se pierde la cara,
-  // la cabeza simplemente acompaña al torso.
   const eyeVis = (fv.lEye + fv.rEye) * 0.5;
   const reliability =
     THREE.MathUtils.clamp((fv.nose - 0.35) / 0.30, 0, 1) *
     THREE.MathUtils.clamp((eyeVis - 0.30) / 0.30, 0, 1);
 
-  // "Mira de frente": zona suave alrededor de 0° donde se fuerza yaw mundial ≈ 0 (mirar a cámara)
   const frontLock = 1 - THREE.MathUtils.smoothstep(Math.abs(faceYawCam), 0.12, 0.38);
   const worldYawRaw = -faceYawCam * (1 - frontLock * 0.9);
 
-  // Suavizado del yaw mundial objetivo (evita temblor del ruido de orejas/nariz)
   let worldYaw = worldYawRaw;
   if (Number.isFinite(prevHeadYaw)) {
     worldYaw = prevHeadYaw + wrapPi(worldYawRaw - prevHeadYaw) * 0.40;
   }
 
-  // Yaw actual del pecho (mundo) y giro local que necesita la cabeza
   const chestYaw = new THREE.Euler().setFromQuaternion(chestQuat, 'YXZ').y;
-  const maxLocalYaw = lookAtCamera ? 1.50 : 0.45;
+  const maxLocalYaw = lookAtCamera ? 1.05 : 0.45;
   const desiredLocal = wrapPi(worldYaw - chestYaw);
   const gain = lookAtCamera ? 1.0 : 0.6;
   const localYaw = THREE.MathUtils.clamp(desiredLocal * reliability * gain, -maxLocalYaw, maxLocalYaw);
 
-  // --- Pitch y roll (suaves) ---
   const frontFactor = Math.max(0.30, Math.cos(faceYawCam));
   const rawRoll = Math.atan2(eyeDy, Math.max(0.035, eyeWidth)) * headGain * frontFactor;
   const rawPitch = (-(pNose.y - eyeCenter.y + 0.02) * 1.15) * headGain * frontFactor;
@@ -408,7 +388,6 @@ function solveHead(
 
   let headWorld = sanitizeQuat(chestQuat.clone().multiply(localHeadOffset));
 
-  // Suavizado final de la cabeza (más ligero que antes: el yaw ya viene filtrado)
   if (prevHeadWorldArray && prevHeadWorldArray.length === 4) {
     const prevHeadQ = sanitizeQuat(new THREE.Quaternion(...prevHeadWorldArray));
     if (prevHeadQ.dot(headWorld) < 0) {
@@ -418,7 +397,6 @@ function solveHead(
   }
 
   return {
-    // El cuello toma ~la mitad del giro para que se vea natural cuando el giro es grande
     neck: sanitizeQuat(chestQuat.clone().slerp(headWorld, 0.5)),
     head: headWorld,
     headYaw: worldYaw
@@ -509,7 +487,6 @@ function solveArms(
 
     upperDirLocal.normalize();
 
-    // --- Detección de brazo en reposo: colgando + casi quieto (respecto a la cadera) ---
     const relWr = new THREE.Vector3().subVectors(pWr, pHip);
     let motion = 0;
     if (prevRel) {
@@ -523,7 +500,6 @@ function solveArms(
     const stillness = 1 - THREE.MathUtils.smoothstep(motion, 0.006, 0.020);
     const idleTarget = config.relaxIdleArms === false ? 0 : hangingPose * stillness;
     const idleBase = prevIdle ?? 0;
-    // entra despacio al reposo, sale rápido cuando el brazo vuelve a moverse
     const idle = idleBase + (idleTarget - idleBase) * (idleTarget > idleBase ? 0.12 : 0.40);
 
     if (idle > 0.001) {
@@ -592,7 +568,6 @@ function solveArms(
       }
 
       if (idle > 0.001) {
-        // En reposo el antebrazo cuelga recto (con una leve flexión natural), sin el empuje hacia delante
         const relaxedLower = new THREE.Vector3(sideSign * 0.04, -1, frontSign * 0.12).normalize();
         safeLowerChest.normalize().lerp(relaxedLower, Math.min(1, idle * 0.9));
       }
@@ -789,17 +764,14 @@ function solveLegs(pLHip, pRHip, pLKn, pRKn, pLAn, pRAn, hipsQuat, hipYaw, confi
   const isTurned = Math.abs(hipYaw) > 0.65;
   const isHighBoostActive = Boolean(config?.highLegBoost);
 
-  // Detectar cuál de las dos piernas está levantada comparando la altura de los tobillos y rodillas
   const lAnkleLift = Math.max(0, pLAn.y - pRAn.y);
   const rAnkleLift = Math.max(0, pRAn.y - pLAn.y);
   const lKneeLift = Math.max(0, (pLKn.y - pLHip.y) + 0.16);
   const rKneeLift = Math.max(0, (pRKn.y - pRHip.y) + 0.16);
 
-  // Solo la pierna que realmente está más arriba recibe el desbloqueo de muslo
   const lIsLifted = isHighBoostActive && (lAnkleLift > 0.025 || (lKneeLift > rKneeLift + 0.03));
   const rIsLifted = isHighBoostActive && (rAnkleLift > 0.025 || (rKneeLift > lKneeLift + 0.03));
 
-  // Si la pierna NO está en modo alto, mantenemos el candado clásico; si sí lo está, dejamos subir la rodilla hasta la cintura (+0.08)
   if (!lIsLifted && pLKn.y > pLHip.y - 0.03) pLKn.y = pLHip.y - 0.14;
   if (!rIsLifted && pRKn.y > pRHip.y - 0.03) pRKn.y = pRHip.y - 0.14;
   if (lIsLifted && pLKn.y > pLHip.y + 0.08) pLKn.y = pLHip.y + 0.08;
@@ -831,19 +803,16 @@ function solveLegs(pLHip, pRHip, pLKn, pRKn, pLAn, pRAn, hipsQuat, hipYaw, confi
       calfDx *= 0.65;
     }
 
-    // Si allowHighThigh está activo en esta pierna, liberamos thighDy para que el muslo suba sin aplastarse
     let thighDy = allowHighThigh
       ? Math.min(0.06, (pKn.y - pHip.y) + ankleLift * 0.35)
       : Math.min(-0.04, pKn.y - pHip.y);
 
-    // La pantorrilla (calfDy) NUNCA se deforma hacia arriba para que el pie siempre apunte al suelo con naturalidad
     const calfDy = Math.min(-0.05, pAn.y - pKn.y);
 
     let thighDz = Math.min(-0.02, (pKn.z - pHip.z) * 0.35 * facingSign);
     let calfDz = Math.max(0.03, (pAn.z - pKn.z) * 0.35 * facingSign);
 
     if (allowHighThigh) {
-      // Adelantamos el muslo suavemente para dar el rango extra sin quebrar la rodilla ni el pie
       const liftFactor = Math.max(ankleLift, 0.08);
       thighDz -= liftFactor * 0.65;
       thighDx *= 1.25;
@@ -867,7 +836,6 @@ function solveLegs(pLHip, pRHip, pLKn, pRKn, pLAn, pRAn, hipsQuat, hipYaw, confi
   const rLegBias = new THREE.Quaternion().setFromAxisAngle(new THREE.Vector3(0, 0, 1), legSpreadRad);
 
   const zero = new THREE.Vector3(0, 0, 0);
-  // Solo aumentamos el ángulo máximo en el muslo (UpperLeg) de la pierna que realmente está levantada (de 1.35 a 1.95 rad)
   const lMaxThighAngle = lIsLifted ? 1.95 : 1.35;
   const rMaxThighAngle = rIsLifted ? 1.95 : 1.35;
 
@@ -990,7 +958,6 @@ export function solvePoseToVRM(worldLandmarks, screenLandmarks, prevFrame, confi
   }
 
   const mirrorSign = config.mirror ? -1 : 1;
-  // App marca prevFrame.cut = true cuando detecta un cambio de plano: no se mezcla con el frame anterior
   const cutReset = Boolean(prevFrame?.cut);
 
   const L = config.mirror
@@ -1037,7 +1004,9 @@ export function solvePoseToVRM(worldLandmarks, screenLandmarks, prevFrame, confi
 
   const prevYaw = cutReset ? rawTorsoYaw : (prevFrame?.torsoYaw ?? rawTorsoYaw);
   const unwrappedYaw = unwrapAngle(rawTorsoYaw, prevYaw);
-  const reliableTorsoYaw = prevYaw + (unwrappedYaw - prevYaw) * 0.35;
+  const yawDiff = Math.abs(unwrappedYaw - prevYaw);
+  const yawFollow = THREE.MathUtils.lerp(0.08, 0.35, THREE.MathUtils.smoothstep(yawDiff, 0.03, 0.18));
+  const reliableTorsoYaw = prevYaw + (unwrappedYaw - prevYaw) * yawFollow;
 
   const hipsData = solveHips(pLHip, pRHip, reliableTorsoYaw, screenLandmarks, mirrorSign, cutReset ? null : prevFrame, config);
   const torsoData = solveSpineAndChest(shCenter, hipCenter, pRSh, pLSh, reliableTorsoYaw, hipsData.quat, hipsData.hipYaw);
@@ -1078,7 +1047,7 @@ export function solvePoseToVRM(worldLandmarks, screenLandmarks, prevFrame, confi
     pLHip, pRHip, config
   );
 
-  const prevLegQuats = prevFrame?.worldQuats && prevFrame.worldQuats.leftUpperLeg ? {
+  const prevLegQuats = (!cutReset && prevFrame?.worldQuats && prevFrame.worldQuats.leftUpperLeg) ? {
     leftUpperLeg: sanitizeQuat(new THREE.Quaternion(...prevFrame.worldQuats.leftUpperLeg)),
     leftLowerLeg: sanitizeQuat(new THREE.Quaternion(...prevFrame.worldQuats.leftLowerLeg)),
     rightUpperLeg: sanitizeQuat(new THREE.Quaternion(...prevFrame.worldQuats.rightUpperLeg)),
@@ -1098,8 +1067,6 @@ export function solvePoseToVRM(worldLandmarks, screenLandmarks, prevFrame, confi
     prevLegQuats
   );
 
-  // Plano cerrado (cara/torso): cadera y rodillas casi invisibles -> MediaPipe inventa las piernas.
-  // Con la opción de cambio de plano activa, se conserva la pose previa de las piernas y la posición de cadera.
   const lowBodyVis = (vis(23) + vis(24) + vis(25) + vis(26)) / 4;
   const lowBodyHidden = Boolean(config.shotCutDetection) && lowBodyVis < 0.35;
   if (lowBodyHidden && prevLegQuats) {
@@ -1164,25 +1131,24 @@ export function solvePoseToVRM(worldLandmarks, screenLandmarks, prevFrame, confi
     }
 
     if (!cutReset && prevFrame && prevFrame.localQuats && prevFrame.localQuats[bone]) {
-      // Brazos: filtro adaptativo. Movimiento pequeño (ruido/temblor) -> casi se queda quieto;
-      // movimiento grande (baile real) -> sigue rápido. Controlado por config.armStability (0..1).
-      const armStab = THREE.MathUtils.clamp(config.armStability ?? 0.6, 0, 1);
-      const isArm = ARM_SET.has(bone) && armStab > 0;
-      const filteredQ = isArm
-        ? localQuats[bone]
-        : applyQuatDeadzone(localQuats[bone], prevFrame.localQuats[bone], 0.008);
+      const relaxLevel = THREE.MathUtils.clamp(config.armStability ?? 0.6, 0, 1);
       const prevQ = sanitizeQuat(new THREE.Quaternion(...prevFrame.localQuats[bone]));
+
+      const deadzoneRad = 0.015 + relaxLevel * 0.030;
+      const filteredQ = applyQuatDeadzone(localQuats[bone], prevFrame.localQuats[bone], deadzoneRad);
+
       if (prevQ.dot(filteredQ) < 0) {
         filteredQ.set(-filteredQ.x, -filteredQ.y, -filteredQ.z, -filteredQ.w);
       }
-      let follow = 1 - (config.smoothing ?? 0.2);
-      if (isArm) {
-        const ang = 2 * Math.acos(Math.min(1, Math.abs(prevQ.dot(filteredQ))));
-        const t = THREE.MathUtils.smoothstep(ang, 0.04, 0.22); // ~2° .. ~13° por frame
-        const slowFollow = THREE.MathUtils.lerp(follow, 0.12, armStab);
-        const fastFollow = Math.max(follow, 0.55 + 0.35 * (1 - armStab));
-        follow = THREE.MathUtils.lerp(slowFollow, fastFollow, t);
-      }
+
+      const ang = 2 * Math.acos(Math.min(1, Math.abs(prevQ.dot(filteredQ))));
+      const baseFollow = 1 - (config.smoothing ?? 0.2);
+
+      const motionWeight = THREE.MathUtils.smoothstep(ang, 0.035, 0.22);
+      const calmFollow = THREE.MathUtils.lerp(baseFollow, 0.08, relaxLevel);
+      const activeFollow = Math.max(baseFollow, 0.50 + 0.35 * (1 - relaxLevel));
+      const follow = THREE.MathUtils.lerp(calmFollow, activeFollow, motionWeight);
+
       prevQ.slerp(filteredQ, follow);
       localQuats[bone].copy(sanitizeQuat(prevQ));
     }
@@ -1190,8 +1156,15 @@ export function solvePoseToVRM(worldLandmarks, screenLandmarks, prevFrame, confi
 
   const finalHipsPos = [...hipsData.pos];
   if (!cutReset && prevFrame && prevFrame.hipsPos) {
+    const relaxLevel = THREE.MathUtils.clamp(config.armStability ?? 0.6, 0, 1);
     for (let i = 0; i < 3; i++) {
-      finalHipsPos[i] = prevFrame.hipsPos[i] * config.smoothing + finalHipsPos[i] * (1 - config.smoothing);
+      const diff = Math.abs(finalHipsPos[i] - prevFrame.hipsPos[i]);
+      const posWeight = THREE.MathUtils.smoothstep(diff, 0.004, 0.035);
+      const calmPosFollow = (1 - config.smoothing) * (1 - relaxLevel * 0.75);
+      const activePosFollow = 1 - config.smoothing * 0.5;
+      const posFollow = THREE.MathUtils.lerp(calmPosFollow, activePosFollow, posWeight);
+
+      finalHipsPos[i] = prevFrame.hipsPos[i] + (finalHipsPos[i] - prevFrame.hipsPos[i]) * posFollow;
     }
   }
 
