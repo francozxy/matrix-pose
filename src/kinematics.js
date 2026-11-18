@@ -116,8 +116,7 @@ function applyQuatDeadzone(currQ, prevQArray, minAngleRad = 0.035) {
   if (!prevQArray) return currQ;
   const prevQ = sanitizeQuat(new THREE.Quaternion(...prevQArray));
   const dot = Math.min(1, Math.abs(currQ.dot(prevQ)));
-  const angle = 2 * Math.acos(dot); // Ángulo real de cambio entre frames
-  // Si se movió menos de ~2 grados (0.035 rad), se queda 100% quieto
+  const angle = 2 * Math.acos(dot);
   if (angle < minAngleRad) {
     return prevQ;
   }
@@ -295,7 +294,7 @@ function solveHips(pLHip, pRHip, reliableTorsoYaw, screenLandmarks, mirrorSign, 
   };
 }
 
-// 2. MÓDULO DE DORSO Y PECHO
+// 2. MÓDULO DE DORSO Y PECHO (Corregido con signo menos para inclinarse hacia adelante)
 function solveSpineAndChest(shCenter, hipCenter, pRSh, pLSh, reliableTorsoYaw, hipsQuat, hipYaw) {
   const spineDir = new THREE.Vector3().subVectors(shCenter, hipCenter);
   const safeSpineY = Math.max(0.08, spineDir.y);
@@ -308,7 +307,7 @@ function solveSpineAndChest(shCenter, hipCenter, pRSh, pLSh, reliableTorsoYaw, h
 
   const shRoll = Math.atan2(shDy, Math.max(0.06, Math.abs(shDx))) * frontalWeight;
   const spinePitch = THREE.MathUtils.clamp(
-    Math.atan2(spineDir.z, safeSpineY) * 0.75 * frontalWeight,
+    -Math.atan2(spineDir.z, safeSpineY) * 0.75 * frontalWeight,
     -0.38,
     0.38
   );
@@ -337,7 +336,7 @@ function solveSpineAndChest(shCenter, hipCenter, pRSh, pLSh, reliableTorsoYaw, h
   };
 }
 
-// 3. MÓDULO DE CABEZA (v2: la cabeza sigue la orientación REAL de la cara en el video)
+// 3. MÓDULO DE CABEZA
 function solveHead(
   pNose, pLEye, pREye, pLEar, pREar, fv,
   chestQuat, reliableTorsoYaw, config, prevHeadWorldArray, prevHeadYaw
@@ -610,7 +609,7 @@ function solveArms(
     } else if (pIndex && pPinky) {
       const handMid = new THREE.Vector3().addVectors(pIndex, pPinky).multiplyScalar(0.5);
       const rawHandVec = new THREE.Vector3().subVectors(handMid, pWr);
-      if (rawHandVec.lengthSq() > 0.0001) {
+      if (rawHandVec.lengthSq> 0.0001) {
         const lowerInv = lowerWorld.clone().invert();
         const handDirLocal = rawHandVec.clone().applyQuaternion(lowerInv).normalize();
         const localHandQuat = new THREE.Quaternion()
@@ -757,7 +756,7 @@ function solveFingers(
   return localFingerQuats;
 }
 
-// 6. MÓDULO DE PIERNAS (Aumenta el rango SOLO en el muslo de la pierna levantada sin deformar los pies)
+// 6. MÓDULO DE PIERNAS
 function solveLegs(pLHip, pRHip, pLKn, pRKn, pLAn, pRAn, hipsQuat, hipYaw, config, prevLegs) {
   const facingCos = Math.cos(hipYaw);
   const facingSign = facingCos >= 0 ? 1 : -1;
@@ -859,7 +858,7 @@ function solveLegs(pLHip, pRHip, pLKn, pRKn, pLAn, pRAn, hipsQuat, hipYaw, confi
   };
 }
 
-// 7. MÓDULO DE EXPRESIONES FACIALES LIGERAS (OPCIÓN 1)
+// 7. MÓDULO DE EXPRESIONES FACIALES LIGERAS
 function solveFaceExpressions(screenLandmarks, pLWr, pRWr, pLSh, pRSh, hipsPos, prevFrame, config) {
   if (!config?.faceTrackingEnabled) {
     return { blink: 0, mouthOpen: 0, smile: 0, relaxed: 0 };
